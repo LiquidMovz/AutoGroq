@@ -81,7 +81,7 @@ class AgentBaseModel:
             "id": self.id,
             "name": self.name,
             "description": self.description,
-            "tools": [tool.to_dict() for tool in self.tools],
+            'tools': [tool.to_dict() if hasattr(tool, 'to_dict') else tool for tool in self.tools],
             "provider": self.provider,
             "model": self.model,
             "config": self.config,
@@ -163,3 +163,12 @@ class AgentBaseModel:
             print(f"  - {param}")
 
         return required_params, optional_params
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __contains__(self, key):
+        return hasattr(self, key)

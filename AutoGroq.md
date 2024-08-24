@@ -8,16 +8,17 @@ import json
 import logging
 import os
 import re
+import requests
 import streamlit as st
 
-from configs.config import LLM_PROVIDER, MODEL_CHOICES, MODEL_TOKEN_LIMITS
+from configs.config import BUILT_IN_AGENTS, LLM_PROVIDER, MODEL_CHOICES, MODEL_TOKEN_LIMITS
 
 from models.agent_base_model import AgentBaseModel
 from models.tool_base_model import ToolBaseModel
-from tools.fetch_web_content import fetch_web_content
 from utils.api_utils import get_api_key
-from utils.error_handling import log_error, log_tool_execution
-from utils.ui_utils import get_llm_provider, get_provider_models, update_discussion_and_whiteboard
+from utils.error_handling import log_error
+from utils.tool_utils import populate_tool_models, show_tools
+from utils.ui_utils import display_goal, get_llm_provider, get_provider_models, update_discussion_and_whiteboard
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ def agent_button_callback(agent_index):
         # Directly call process_agent_interaction here if appropriate
         process_agent_interaction(agent_index)
     return callback
+
 
 def construct_request(agent, agent_name, description, user_request, user_input, rephrased_request, reference_url, tool_results):
     request = f"Act as the {agent_name} who {description}."
@@ -83,38 +85,65 @@ def construct_request(agent, agent_name, description, user_request, user_input, 
 
 
 def display_agents():
-    if "agents" in st.session_state and st.session_state.agents and len(st.session_state.agents) > 0:
-        st.sidebar.title("Your Agents")
-        st.sidebar.subheader("Click to interact")
-        
-        for index, agent in enumerate(st.session_state.agents):
-            agent_name = agent.name
-            col1, col2 = st.sidebar.columns([1, 4])
-            with col1:
-                gear_icon = "⚙️"
-                if st.button(gear_icon, key=f"gear_{index}", help="Edit Agent"):
-                    st.session_state['edit_agent_index'] = index
-                    st.session_state[f'show_edit_{index}'] = not st.session_state.get(f'show_edit_{index}', False)
-            with col2:
-                if "next_agent" in st.session_state and st.session_state.next_agent == agent_name:
-                    button_style = """
-                    <style>
-                    div[data-testid*="stButton"] > button[kind="secondary"] {
-                        background-color: green !important;
-                        color: white !important;
-                    }
-                    </style>
-                    """
-                    st.markdown(button_style, unsafe_allow_html=True)
-                st.button(agent_name, key=f"agent_{index}", on_click=agent_button_callback(index))
-            
-            if st.session_state.get(f'show_edit_{index}', False):
-                display_agent_edit_form(agent, index)
-
-    else:
+    if "agents" in st.session_state and st.session_state.agents and len(st.session_state.agents) == 3:
         st.sidebar.warning(f"No agents have yet been created. Please enter a new request.")
         st.sidebar.warning(f"ALSO: If no agents are created, do a hard reset (CTL-F5) and try switching models. LLM results can be unpredictable.")
         st.sidebar.warning(f"SOURCE:  https://github.com/jgravelle/AutoGroq\n\r\n\r https://j.gravelle.us\n\r\n\r DISCORD: https://discord.gg/DXjFPX84gs \n\r\n\r YouTube: https://www.youtube.com/playlist?list=PLPu97iZ5SLTsGX3WWJjQ5GNHy7ZX66ryP")
+
+    else:
+        st.sidebar.title("Your Agents")
+        st.sidebar.subheader("Click to interact")
+        
+        dynamic_agents_exist = False
+        built_in_agents = []
+
+        # First pass: Identify if there are any dynamic agents and collect built-in agents
+        for index, agent in enumerate(st.session_state.agents):
+            if agent.name not in BUILT_IN_AGENTS:
+                dynamic_agents_exist = True
+            else:
+                built_in_agents.append((agent, index))
+
+        # Display dynamically created agents
+        for index, agent in enumerate(st.session_state.agents):
+            if agent.name not in BUILT_IN_AGENTS:
+                display_agent_button(agent, index)
+
+        # Display built-in agents only if dynamic agents exist
+        if dynamic_agents_exist and built_in_agents:
+            st.sidebar.markdown("---")
+            st.sidebar.markdown("Built-in Agents:")
+            for agent, index in built_in_agents:
+                display_agent_button(agent, index)
+            display_goal()
+            populate_tool_models()
+            show_tools()
+        else:
+            st.empty()
+
+
+def display_agent_button(agent, index):
+    col1, col2 = st.sidebar.columns([1, 4])
+    with col1:
+        gear_icon = "⚙️"
+        if st.button(gear_icon, key=f"gear_{index}", help="Edit Agent"):
+            st.session_state['edit_agent_index'] = index
+            st.session_state[f'show_edit_{index}'] = not st.session_state.get(f'show_edit_{index}', False)
+    with col2:
+        if "next_agent" in st.session_state and st.session_state.next_agent == agent.name:
+            button_style = """
+            <style>
+            div[data-testid*="stButton"] > button[kind="secondary"] {
+                background-color: green !important;
+                color: white !important;
+            }
+            </style>
+            """
+            st.markdown(button_style, unsafe_allow_html=True)
+        st.button(agent.name, key=f"agent_{index}", on_click=agent_button_callback(index))
+    
+    if st.session_state.get(f'show_edit_{index}', False):
+        display_agent_edit_form(agent, index)
 
 
 def display_agent_buttons(agents):
@@ -200,6 +229,10 @@ def display_agent_edit_form(agent, edit_index):
             if st.button("Set for ALL agents", key=f"set_all_agents_{edit_index}_{agent.name}"):
                 for agent in st.session_state.agents:
                     agent.config['provider'] = selected_provider
+                    if 'llm_config' not in agent.config:
+                        agent.config['llm_config'] = {'config_list': [{}]}
+                    if not agent.config['llm_config']['config_list']:
+                        agent.config['llm_config']['config_list'] = [{}]
                     agent.config['llm_config']['config_list'][0]['model'] = selected_model
                     agent.config['llm_config']['max_tokens'] = provider_models[selected_model]
                 st.experimental_rerun()
@@ -229,6 +262,10 @@ def display_agent_edit_form(agent, edit_index):
                 
                 # Update the config as well
                 agent.config['provider'] = selected_provider
+                if 'llm_config' not in agent.config:
+                    agent.config['llm_config'] = {'config_list': [{}]}
+                if not agent.config['llm_config']['config_list']:
+                    agent.config['llm_config']['config_list'] = [{}]
                 agent.config['llm_config']['config_list'][0]['model'] = selected_model
                 agent.config['llm_config']['max_tokens'] = provider_models[selected_model]
                 
@@ -241,6 +278,7 @@ def display_agent_edit_form(agent, edit_index):
 
     # Add a debug print to check the agent's description
     print(f"Agent {agent.name} description: {agent.description}")
+
 
 def download_agent_file(expert_name):
     # Format the expert_name
@@ -263,8 +301,29 @@ def download_agent_file(expert_name):
         st.error(f"File not found: {json_file}")
 
 
+def extract_content(response):
+    if isinstance(response, dict) and 'choices' in response:
+        # Handle response from providers like Groq
+        return response['choices'][0]['message']['content']
+    elif hasattr(response, 'content') and isinstance(response.content, list):
+        # Handle Anthropic-style response
+        return response.content[0].text
+    elif isinstance(response, requests.models.Response):
+        # Handle response from providers using requests.Response
+        try:
+            json_response = response.json()
+            if 'choices' in json_response and json_response['choices']:
+                return json_response['choices'][0]['message']['content']
+        except json.JSONDecodeError:
+            logger.error("Failed to decode JSON from response")
+    logger.error(f"Unexpected response format: {type(response)}")
+    return None
+
+
 def process_agent_interaction(agent_index):
     agent = st.session_state.agents[agent_index]
+    logger.debug(f"Processing interaction for agent: {agent.name}")
+    logger.debug(f"Agent tools: {agent.tools}")
     
     if isinstance(agent, AgentBaseModel):
         agent_name = agent.name
@@ -285,45 +344,36 @@ def process_agent_interaction(agent_index):
     tool_results = {}
     for tool in agent_tools:
         try:
-            logger.debug(f"Executing tool: {tool.name if isinstance(tool, ToolBaseModel) else tool['name']}")
-            if isinstance(tool, ToolBaseModel):
+            logger.debug(f"Executing tool: {tool.name}")
+            if tool.name in st.session_state.tool_functions:
+                tool_function = st.session_state.tool_functions[tool.name]
                 if tool.name == 'fetch_web_content' and reference_url:
-                    tool_result = tool.execute(reference_url)
+                    tool_result = tool_function(reference_url)
+                elif tool.name == 'generate_code':
+                    tool_result = tool_function(user_input or user_request or rephrased_request)
                 else:
-                    tool_result = tool.execute()
+                    tool_result = tool_function(user_input or user_request or rephrased_request)
+                logger.debug(f"Tool result: {tool_result[:500]}...")  # Log first 500 characters of result
             else:
-                # Handle the case where tool is a dictionary
-                if tool['name'] == 'fetch_web_content' and reference_url:
-                    tool_result = fetch_web_content(reference_url)
-                else:
-                    # You might need to implement a way to execute other tools here
-                    tool_result = "Tool execution not implemented for dictionary-based tools"
+                logger.error(f"Tool function not found for {tool.name}")
+                tool_result = f"Error: Tool function not found for {tool.name}"
             
-            tool_name = tool.name if isinstance(tool, ToolBaseModel) else tool['name']
-            tool_results[tool_name] = tool_result
+            tool_results[tool.name] = tool_result
             
-            logger.debug(f"Tool result for {tool_name}: {tool_result[:500]}...")
+            logger.debug(f"Tool result for {tool.name}: {tool_result[:500]}...")
             
-            # Parse the JSON result
-            result_dict = json.loads(tool_result)
-            if result_dict['status'] == 'success':
-                content = f"Successfully fetched content from {result_dict['url']}:\n\n{result_dict['content'][:1000]}..." # Limit to first 1000 characters
-                st.session_state.tool_result_string = content
-            else:
-                content = f"Error fetching content: {result_dict['message']}"
-                st.session_state.tool_result_string = content
-            
-            logger.debug(f"tool_result_string set to: {st.session_state.tool_result_string[:500]}...")
+            # Update the tool_result_string in the session state
+            st.session_state.tool_result_string = tool_result[:1000] + "..."  # Limit to first 1000 characters
             
             # Update the discussion and whiteboard immediately
-            update_discussion_and_whiteboard("Web Content Retriever", content, "")
+            update_discussion_and_whiteboard(tool.name, st.session_state.tool_result_string, "")
             
         except Exception as e:
-            error_message = f"Error executing tool {tool.name if isinstance(tool, ToolBaseModel) else tool['name']}: {str(e)}"
-            logger.error(error_message)
-            tool_results[tool.name if isinstance(tool, ToolBaseModel) else tool['name']] = error_message
+            error_message = f"Error executing tool {tool.name}: {str(e)}"
+            logger.error(error_message, exc_info=True)
+            tool_results[tool.name] = error_message
             st.session_state.tool_result_string = error_message
-            update_discussion_and_whiteboard("Web Content Retriever", error_message, "")
+            update_discussion_and_whiteboard(tool.name, error_message, "")
     
     request = construct_request(agent, agent_name, description, user_request, user_input, rephrased_request, reference_url, tool_results)
     
@@ -357,23 +407,19 @@ def process_agent_interaction(agent_index):
     logger.debug(f"Sending request to {provider} using model {model}")
     response = llm_provider.send_request(llm_request_data)
     
-    if response.status_code == 200:
-        response_data = llm_provider.process_response(response)
-        if "choices" in response_data and response_data["choices"]:
-            content = response_data["choices"][0]["message"]["content"]
-            
-            # Update the most recent response
-            st.session_state.most_recent_response = f"{agent_name}:\n\n{content}\n\n"
-            
-            update_discussion_and_whiteboard(agent_name, content, user_input)
-            st.session_state['form_agent_name'] = agent_name
-            st.session_state['form_agent_description'] = description
-            st.session_state['selected_agent_index'] = agent_index
+    content = extract_content(response)
+    if content:
+        update_discussion_and_whiteboard(agent_name, content, user_input)
+        st.session_state['form_agent_name'] = agent_name
+        st.session_state['form_agent_description'] = description
+        st.session_state['selected_agent_index'] = agent_index
     else:
-        error_message = f"Error: Received status code {response.status_code}"
+        error_message = f"Error: Failed to extract content from response"
         log_error(error_message)
-        print(error_message)
-        print(f"Response: {response.text}")
+        logger.error(error_message)
+
+    # Force a rerun to update the UI and trigger the moderator if necessary
+    st.experimental_rerun()
 
 
 def regenerate_agent_description(agent):
@@ -444,13 +490,13 @@ def send_request(agent_name, request):
 import streamlit as st 
 
 from agent_management import display_agents
-from utils.api_utils import get_api_key
+from utils.api_utils import fetch_available_models, get_api_key
 from utils.auth_utils import display_api_key_input
 from utils.error_handling import setup_logging
 from utils.session_utils import initialize_session_variables
-from utils.tool_utils import load_tool_functions, populate_tool_models, show_tools
+from utils.tool_utils import load_tool_functions
 from utils.ui_utils import (
-    display_goal, display_reset_and_upload_buttons, 
+    display_reset_and_upload_buttons, 
     display_user_request_input, handle_user_request, 
     select_model, select_provider, set_css, 
     set_temperature, show_interfaces
@@ -465,6 +511,7 @@ def main():
 
     set_css()
     initialize_session_variables()
+    fetch_available_models()
     load_tool_functions()
 
     if st.session_state.get("need_rerun", False):
@@ -473,6 +520,7 @@ def main():
 
     display_api_key_input()
     get_api_key() 
+    
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
         select_provider()
@@ -494,15 +542,7 @@ def main():
         
     with st.sidebar:
         display_agents()
-        if "agents" in st.session_state and st.session_state.agents:
-            display_goal()
-            populate_tool_models()
-            show_tools()
-        else:
-            st.empty()  
-
-    
-
+         
 
 if __name__ == "__main__":
     main()
@@ -563,36 +603,27 @@ def get_agent_prompt(rephrased_request):
 
 
 def get_agents_prompt():
-    return f"""
-        This agent is an expert system designed to format the JSON describing each member of the team 
-        of AI agents specifically listed in this provided text: $text.
-        Fulfill the following guidelines without ever explicitly stating them in this agent's response.
-        Guidelines:
-        1. **Agent Roles**: Clearly transcribe the titles of each agent listed in the provided text 
-            by iterating through the 'Team of Experts:' section of the provided text. Transcribe 
-            the info for those specific agents. Do not create new agents.
-        2. **Expertise Description**: Provide a brief but thorough description of each agent's expertise 
-            based upon the provided text. Do not create new agents.
-        3. **Format**: Return the results in JSON format with values labeled as expert_name, description, role, goal, and backstory.
-            'expert_name' should be the agent's title, not their given or proper name.
+    return """
+    You are an expert system designed to format the JSON describing each member of the team 
+    of AI agents listed in the 'Team of Experts' section below. Follow these guidelines:
+    1. Agent Roles: Clearly transcribe the titles of each agent listed.
+    2. Expertise Description: Provide a brief but thorough description of each agent's expertise 
+       based on the provided information.
+    3. Format: Return the results in JSON format with values labeled as expert_name, description, role, goal, and backstory.
+       'expert_name' should be the agent's title, not their given or proper name.
 
-        ALWAYS and ONLY return the results in the following JSON format, with no other narrative, commentary, synopsis, 
-        or superfluous text of any kind:
-        [
-            {{
-                "expert_name": "agent_title",
-                "description": "agent_description",
-                "role": "agent_role",
-                "goal": "agent_goal",
-                "backstory": "agent_backstory"
-            }}
-        ]
-        This agent will only have been successful if it has returned the results in the above format 
-        and followed these guidelines precisely by transcribing the provided text and returning the results 
-        in JSON format without any other narrative, commentary, synopsis, or superfluous text of any kind, 
-        and taking care to only transcribe the agents from the provided text without creating new agents.
-        """
-
+    Return ONLY the JSON array, with no other text:
+    [
+        {
+            "expert_name": "agent_title",
+            "description": "agent_description",
+            "role": "agent_role",
+            "goal": "agent_goal",
+            "backstory": "agent_backstory"
+        }
+    ]
+    """
+        
 # Contributed by ScruffyNerf
 def get_generate_tool_prompt(rephrased_tool_request):
     return f'''
@@ -648,19 +679,37 @@ def get_generate_tool_prompt(rephrased_tool_request):
                 '''
 
 
-def get_moderator_prompt(discussion_history, goal, last_comment, last_speaker,team_members_str): 
+def get_moderator_prompt(discussion_history, goal, last_comment, last_speaker, team_members_str, current_deliverable, current_phase):
     return f"""
-        This agent is our Moderator Bot. It's goal is to mediate the conversation between a team of AI agents 
+        This agent is our Moderator Bot. Its goal is to mediate the conversation between a team of AI agents 
         in a manner that persuades them to act in the most expeditious and thorough manner to accomplish their goal. 
         This will entail considering the user's stated goal, the conversation thus far, the descriptions 
         of all the available agent/experts in the current team, the last speaker, and their remark. 
-        Based upon a holistic analysis of all the facts at hand, use logic and reasoning to decide who should speak next. 
+        Based upon a holistic analysis of all the facts at hand, use logic and reasoning to decide which team member should speak next. 
         Then draft a prompt directed at that agent that persuades them to act in the most expeditious and thorough manner toward helping this team of agents 
-        accomplish their goal.\n\nTheir goal is: {goal}.\nThe last speaker was {last_speaker}, who said: 
-        {last_comment}\nHere is the current conversational discussion history: {discussion_history}\n
-        And here are the team members and their descriptions:\n{team_members_str}\n\n
+        accomplish their goal.
+
+        Their overall goal is: {goal}.
+        The current deliverable they're working on is: {current_deliverable}
+        The current implementation phase is: {current_phase}
+        The last speaker was {last_speaker}, who said: {last_comment}
+
+        Here is the current conversational discussion history: {discussion_history}
+
+        And here are the team members and their descriptions:
+        {team_members_str}
+
+        IMPORTANT: Your response must start with "To [Agent Name]:", where [Agent Name] is one of the valid team members listed above. Do not address tools or non-existent team members.
+
         This agent's response should be JUST the requested prompt addressed to the next agent, and should not contain 
         any introduction, narrative, or any other superfluous text whatsoever.
+
+        If you believe the current phase of the deliverable has been satisfactorily completed, include the exact phrase 
+        "PHASE_COMPLETED" at the beginning of your response, followed by your usual prompt to the next agent focusing on 
+        the next phase or deliverable.
+
+        Remember, we are now in the {current_phase} phase. The agents should focus on actually implementing, coding, 
+        testing, or deploying the solutions as appropriate for the current phase, not just planning.
     """
 
 
@@ -697,6 +746,113 @@ def get_rephrased_user_prompt(user_request):
         
 ```
 
+# AutoGroq\agents\code_developer.py
+
+```python
+# agents/code_developer.py
+
+import datetime
+import streamlit as st
+from configs.config import LLM_PROVIDER
+from models.agent_base_model import AgentBaseModel
+from models.tool_base_model import ToolBaseModel
+from tools.code_generator import code_generator_tool
+
+class CodeDeveloperAgent(AgentBaseModel):
+    def __init__(self, name, description, tools, config, role, goal, backstory, provider, model):
+        current_timestamp = datetime.datetime.now().isoformat()
+        super().__init__(name=name, description=description, tools=tools, config=config,
+                         role=role, goal=goal, backstory=backstory)
+        self.provider = provider
+        self.model = model
+        self.created_at = current_timestamp
+        self.updated_at = current_timestamp
+        self.user_id = "default"
+        self.timestamp = current_timestamp
+
+    @classmethod
+    def create_default(cls):
+        return cls(
+            name="Code Developer",
+            description="An agent specialized in generating code based on feature descriptions.",
+            tools=[code_generator_tool],
+            config={
+                "llm_config": {
+                    "config_list": [{"model": st.session_state.get('model', 'default'), "api_key": None}],
+                    "temperature": st.session_state.get('temperature', 0.7)
+                },
+                "human_input_mode": "NEVER",
+                "max_consecutive_auto_reply": 10
+            },
+            role="Code Developer",
+            goal="To create efficient and effective code solutions based on given requirements.",
+            backstory="I am an AI agent with extensive knowledge of various programming languages and software development best practices. My purpose is to assist in creating code that meets the specified requirements.",
+            provider=st.session_state.get('provider', LLM_PROVIDER),
+            model=st.session_state.get('model', 'default')
+        )
+    
+
+    def to_dict(self):
+        data = self.__dict__
+        for key, value in data.items():
+            if isinstance(value, ToolBaseModel):
+                data[key] = value.to_dict()
+        return data
+```
+
+# AutoGroq\agents\code_tester.py
+
+```python
+# agents/code_tester.py
+
+import datetime
+import streamlit as st
+from configs.config import LLM_PROVIDER
+from models.agent_base_model import AgentBaseModel
+from models.tool_base_model import ToolBaseModel
+from tools.code_test import code_test_tool
+
+class CodeTesterAgent(AgentBaseModel):
+    def __init__(self, name, description, tools, config, role, goal, backstory, provider, model):
+        current_timestamp = datetime.datetime.now().isoformat()
+        super().__init__(name=name, description=description, tools=tools, config=config,
+                         role=role, goal=goal, backstory=backstory)
+        self.provider = provider
+        self.model = model
+        self.created_at = current_timestamp
+        self.updated_at = current_timestamp
+        self.user_id = "default"
+        self.timestamp = current_timestamp
+
+    @classmethod
+    def create_default(cls):
+        return cls(
+            name="Code Tester",
+            description="An agent specialized in testing code and providing feedback on its functionality.",
+            tools=[code_test_tool],
+            config={
+                "llm_config": {
+                    "config_list": [{"model": st.session_state.get('model', 'default'), "api_key": None}],
+                    "temperature": st.session_state.get('temperature', 0.7)
+                },
+                "human_input_mode": "NEVER",
+                "max_consecutive_auto_reply": 10
+            },
+            role="Code Tester",
+            goal="To thoroughly test code and provide comprehensive feedback to ensure its reliability and correctness.",
+            backstory="I am an AI agent with expertise in software testing and quality assurance. My purpose is to rigorously test code and provide comprehensive feedback to ensure its reliability and correctness.",
+            provider=st.session_state.get('provider', LLM_PROVIDER),
+            model=st.session_state.get('model', 'default')
+        )
+
+    def to_dict(self):
+        data = self.__dict__
+        for key, value in data.items():
+            if isinstance(value, ToolBaseModel):
+                data[key] = value.to_dict()
+        return data
+```
+
 # AutoGroq\agents\web_content_retriever.py
 
 ```python
@@ -704,51 +860,91 @@ def get_rephrased_user_prompt(user_request):
 
 import datetime
 import streamlit as st
-
 from configs.config import LLM_PROVIDER
 from models.agent_base_model import AgentBaseModel
 from models.tool_base_model import ToolBaseModel
 from tools.fetch_web_content import fetch_web_content_tool
 
-
 class WebContentRetrieverAgent(AgentBaseModel):
+    def __init__(self, name, description, tools, config, role, goal, backstory, provider, model):
+        current_timestamp = datetime.datetime.now().isoformat()
+        super().__init__(name=name, description=description, tools=tools, config=config,
+                         role=role, goal=goal, backstory=backstory)
+        self.provider = provider
+        self.model = model
+        self.created_at = current_timestamp
+        self.updated_at = current_timestamp
+        self.user_id = "default"
+        self.timestamp = current_timestamp
+        self.reference_url = None
+        self.web_content = None
+
     @classmethod
     def create_default(cls):
-        current_timestamp = datetime.datetime.now().isoformat()
         return cls(
             name="Web Content Retriever",
             description="An agent specialized in retrieving and processing web content.",
-            tools=[fetch_web_content_tool.to_dict()],  # Convert ToolBaseModel to dictionary
+            tools=[fetch_web_content_tool],
             config={
-                "name": "Web Content Retriever",
                 "llm_config": {
-                    "config_list": [
-                        {
-                            "model": st.session_state.get('model', 'default'),
-                            "api_key": None,
-                        }
-                    ],
-                    "temperature": st.session_state.get('temperature', 0.7),
+                    "config_list": [{"model": st.session_state.get('model', 'default'), "api_key": None}],
+                    "temperature": st.session_state.get('temperature', 0.7)
                 },
                 "human_input_mode": "NEVER",
-                "max_consecutive_auto_reply": 10,
-                "system_message": "You are an AI agent designed to fetch and analyze web content, providing valuable insights and information from various online sources."
+                "max_consecutive_auto_reply": 10
             },
             role="Web Content Specialist",
-            goal="Retrieve and process web content efficiently",
+            goal="To retrieve and analyze web content efficiently and accurately.",
             backstory="I am an AI agent designed to fetch and analyze web content, providing valuable insights and information from various online sources.",
             provider=st.session_state.get('provider', LLM_PROVIDER),
-            model=st.session_state.get('model', 'default'),
-            created_at=current_timestamp,
-            updated_at=current_timestamp,
-            user_id="default",
-            timestamp=current_timestamp
+            model=st.session_state.get('model', 'default')
         )
 
     def to_dict(self):
-        data = super().to_dict()
-        data['tools'] = [tool.to_dict() if isinstance(tool, ToolBaseModel) else tool for tool in self.tools]
+        data = self.__dict__
+        for key, value in data.items():
+            if isinstance(value, ToolBaseModel):
+                data[key] = value.to_dict()
         return data
+
+    def retrieve_web_content(self, reference_url):
+        """
+        Retrieve web content from the given reference URL and store it in the agent's memory.
+        
+        Args:
+            reference_url (str): The URL to fetch content from.
+        
+        Returns:
+            dict: A dictionary containing the status, URL, and content (or error message).
+        """
+        self.reference_url = reference_url
+        fetch_tool = next((tool for tool in self.tools if tool.name == "fetch_web_content"), None)
+        if fetch_tool is None:
+            return {"status": "error", "message": "fetch_web_content tool not found"}
+        
+        result = fetch_tool.function(reference_url)
+        if result["status"] == "success":
+            self.web_content = result["content"]
+        return result
+
+    def get_web_content(self):
+        """
+        Get the stored web content.
+        
+        Returns:
+            str: The stored web content or None if not available.
+        """
+        return self.web_content
+
+    def get_reference_url(self):
+        """
+        Get the stored reference URL.
+        
+        Returns:
+            str: The stored reference URL or None if not available.
+        """
+        return self.reference_url
+
 ```
 
 # AutoGroq\cli\create_agent.py
@@ -924,6 +1120,9 @@ if __name__ == "__main__":
 
 import os
 
+from typing import Dict
+
+
 # Get user home directory
 home_dir = os.path.expanduser("~")
 default_db_path = f'{home_dir}/.autogenstudio/database.sqlite'
@@ -997,10 +1196,10 @@ elif LLM_PROVIDER == "ollama":
 elif LLM_PROVIDER == "anthropic":
     API_URL = ANTHROPIC_API_URL
     MODEL_TOKEN_LIMITS = {
-        "claude-3-5-sonnet-20240620": 200000, 
-        "claude-3-opus-20240229": 200000,
-        "claude-3-sonnet-20240229": 200000,
-        "claude-3-haiku-20240307": 200000,
+        "claude-3-5-sonnet-20240620": 4096,
+        "claude-3-opus-20240229": 4096,
+        "claude-3-sonnet-20240229": 4096,
+        "claude-3-haiku-20240307": 4096,
         "claude-2.1": 100000,
         "claude-2.0": 100000,
         "claude-instant-1.2": 100000,
@@ -1014,13 +1213,13 @@ FRAMEWORK_DB_PATH = os.environ.get('FRAMEWORK_DB_PATH', default_db_path)
 
 MODEL_CHOICES = {
     "anthropic": {
-        "claude-3-5-sonnet-20240620": 200000,
-        "claude-3-opus-20240229": 200000,
-        "claude-3-sonnet-20240229": 200000,
-        "claude-3-haiku-20240307": 200000,
-        "claude-2.1": 100000,
-        "claude-2.0": 100000,
-        "claude-instant-1.2": 100000,
+    "claude-3-5-sonnet-20240620": 4096,
+    "claude-3-opus-20240229": 4096,
+    "claude-3-sonnet-20240229": 4096,
+    "claude-3-haiku-20240307": 4096,
+    "claude-2.1": 100000,
+    "claude-2.0": 100000,
+    "claude-instant-1.2": 100000,
     },
     "groq": {
         "mixtral-8x7b-32768": 32768,
@@ -1032,6 +1231,7 @@ MODEL_CHOICES = {
         "gpt-4o": 4096,
         "gpt-4": 8192,
         "gpt-3.5-turbo": 4096,
+        "dall-e-3": 4096,
     },
     "fireworks": {
         "fireworks": 4096,
@@ -1046,6 +1246,20 @@ MODEL_CHOICES = {
 }
 
 SUPPORTED_PROVIDERS = ["anthropic", "fireworks", "groq", "lmstudio", "ollama", "openai"]    
+
+BUILT_IN_AGENTS = ["Web Content Retriever", "Code Developer", "Code Tester"]
+
+AVAILABLE_MODELS: Dict[str, Dict[str, int]] = {}
+
+def update_available_models(provider: str, models: Dict[str, int]):
+    """
+    Update the available models for a given provider.
+    
+    :param provider: The name of the provider (e.g., 'groq', 'openai')
+    :param models: A dictionary of model names and their token limits
+    """
+    global AVAILABLE_MODELS
+    AVAILABLE_MODELS[provider] = models
 ```
 
 # AutoGroq\configs\config_agent.py
@@ -1181,19 +1395,55 @@ class Current_Project:
     def __init__(self):
         self.deliverables = []
         self.re_engineered_prompt = ""
+        self.implementation_phases = ["Planning", "Development", "Testing", "Deployment"]
+        self.current_phase = "Planning"
+
 
     def add_deliverable(self, deliverable):
-        self.deliverables.append({"text": deliverable, "done": False})
+        self.deliverables.append({
+            "text": deliverable, 
+            "done": False,
+            "phase": {phase: False for phase in self.implementation_phases}
+        })
 
 
-    def mark_deliverable_done(self, index):
+    def get_next_unchecked_deliverable(self):
+        for index, deliverable in enumerate(self.deliverables):
+            if not deliverable["done"]:
+                return index, deliverable["text"]
+        return None, None
+    
+
+    def get_next_uncompleted_phase(self, index):
         if 0 <= index < len(self.deliverables):
-            self.deliverables[index]["done"] = True
+            for phase in self.implementation_phases:
+                if not self.deliverables[index]["phase"][phase]:
+                    return phase
+        return None    
 
+
+    def is_deliverable_complete(self, index):
+        if 0 <= index < len(self.deliverables):
+            return all(self.deliverables[index]["phase"].values())
+        return False
+
+
+    def mark_deliverable_phase_done(self, index, phase):
+        if 0 <= index < len(self.deliverables):
+            self.deliverables[index]["phase"][phase] = True
+            if self.is_deliverable_complete(index):
+                self.deliverables[index]["done"] = True
+                
 
     def mark_deliverable_undone(self, index):
         if 0 <= index < len(self.deliverables):
             self.deliverables[index]["done"] = False
+
+
+    def move_to_next_phase(self):
+        current_index = self.implementation_phases.index(self.current_phase)
+        if current_index < len(self.implementation_phases) - 1:
+            self.current_phase = self.implementation_phases[current_index + 1]            
 
 
     def set_re_engineered_prompt(self, prompt):
@@ -1212,23 +1462,22 @@ import streamlit as st
 from llm_providers.base_provider import BaseLLMProvider
 
 class AnthropicProvider(BaseLLMProvider):
-    def __init__(self, api_key, api_url=None):
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.api_url = api_url 
+    def __init__(self, api_url, api_key):
+        self.api_key = api_key
+        self.api_url = api_url or "https://api.anthropic.com/v1/messages"
+        self.client = anthropic.Anthropic(api_key=self.api_key)
 
-    def send_request(self, data):
-        try:
-            response = self.client.messages.create(
-                model=data['model'],
-                max_tokens=data.get('max_tokens', 1000),
-                temperature=data.get('temperature', st.session_state.temperature),
-                messages=data['messages']
-            )
-            return response
-        except anthropic.APIError as e:
-            print(f"Anthropic API error: {e}")
-            return None
-
+    def get_available_models(self):
+        return {
+            "claude-3-5-sonnet-20240620": 4096,
+            "claude-3-opus-20240229": 4096,
+            "claude-3-sonnet-20240229": 4096,
+            "claude-3-haiku-20240307": 4096,
+            "claude-2.1": 100000,
+            "claude-2.0": 100000,
+            "claude-instant-1.2": 100000,
+        }
+                
     def process_response(self, response):
         if response is not None:
             return {
@@ -1241,6 +1490,25 @@ class AnthropicProvider(BaseLLMProvider):
                 ]
             }
         return None
+    
+    def send_request(self, data):
+        try:
+            model = data['model']
+            max_tokens = min(data.get('max_tokens', 1000), self.get_available_models()[model])
+            
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=data.get('temperature', st.session_state.temperature),
+                messages=[
+                    {"role": "user", "content": message["content"]}
+                    for message in data['messages']
+                ]
+            )
+            return response
+        except anthropic.APIError as e:
+            print(f"Anthropic API error: {e}")
+            return None
 ```
 
 # AutoGroq\llm_providers\base_provider.py
@@ -1260,6 +1528,10 @@ class BaseLLMProvider(ABC):
     @abstractmethod
     def process_response(self, response):
         pass
+
+    @abstractmethod
+    def get_available_models(self):
+        pass
 ```
 
 # AutoGroq\llm_providers\fireworks_provider.py
@@ -1270,13 +1542,15 @@ import json
 import requests
 
 from llm_providers.base_provider import BaseLLMProvider
-from utils.auth_utils import get_api_key
 
 
 class FireworksProvider(BaseLLMProvider):
-    def __init__(self, api_url):
-        self.api_key = get_api_key()
+    def __init__(self, api_url, api_key):
         self.api_url = api_url
+
+
+    def get_available_models(self):
+        return None
 
 
     def process_response(self, response):
@@ -1310,16 +1584,19 @@ import requests
 
 from llm_providers.base_provider import BaseLLMProvider
 
-class GroqProvider(BaseLLMProvider):
+
+class GroqProvider:
     def __init__(self, api_url, api_key):
         self.api_key = api_key
-        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.api_url = api_url or "https://api.groq.com/openai/v1/chat/completions"
+
 
     def process_response(self, response):
         if response.status_code == 200:
             return response.json()
         else:
             raise Exception(f"Request failed with status code {response.status_code}")
+
 
     def send_request(self, data):
         headers = {
@@ -1334,20 +1611,43 @@ class GroqProvider(BaseLLMProvider):
         response = requests.post(self.api_url, data=json_data, headers=headers)
         return response
     
+
+    def get_available_models(self):
+        response = requests.get("https://api.groq.com/openai/v1/models", headers={
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        })
+        if response.status_code == 200:
+            models_data = response.json().get("data", [])
+            return {model["id"]: model.get("max_tokens", 4096) for model in models_data}
+        else:
+            raise Exception(f"Failed to retrieve models: {response.status_code}")
 ```
 
 # AutoGroq\llm_providers\lmstudio_provider.py
 
 ```python
+# llm_providers/lmstudio_provider.py
 
 import json
 import requests
+import streamlit as st
 
 from llm_providers.base_provider import BaseLLMProvider
 
-class LmstudioProvider(BaseLLMProvider):
-    def __init__(self, api_url, api_key=None):
-        self.api_url = "http://localhost:1234/v1/chat/completions"
+
+class LmstudioProvider:
+    def __init__(self, api_url, api_key):
+        self.api_url = api_url or "http://localhost:1234/v1/chat/completions"
+
+
+    def get_available_models(self):
+        return {
+            "instructlab/granite-7b-lab-GGUF": 2048,
+            "MaziyarPanahi/Codestral-22B-v0.1-GGUF": 32768,
+            # Add other LMStudio models here
+        }
+
 
     def process_response(self, response):
         if response.status_code == 200:
@@ -1367,6 +1667,7 @@ class LmstudioProvider(BaseLLMProvider):
                 raise Exception("Unexpected response format. 'choices' field missing.")
         else:
             raise Exception(f"Request failed with status code {response.status_code}")
+
 
     def send_request(self, data):
         headers = {
@@ -1396,15 +1697,26 @@ class LmstudioProvider(BaseLLMProvider):
 # AutoGroq\llm_providers\ollama_provider.py
 
 ```python
+# llm_providers/ollama_provider.py
+
 import json
 import requests
 import streamlit as st
 
 from llm_providers.base_provider import BaseLLMProvider
 
-class OllamaProvider(BaseLLMProvider):
-    def __init__(self, api_url, api_key=None):
-        self.api_url = "http://127.0.0.1:11434/api/generate"
+
+class OllamaProvider:
+    def __init__(self, api_url, api_key):
+        self.api_url = api_url or "http://127.0.0.1:11434/api/generate"
+
+
+    def get_available_models(self):
+        return {
+            "llama3": 8192,
+            # Add other Ollama models here
+        }
+    
 
     def process_response(self, response):
         if response.status_code == 200:
@@ -1427,6 +1739,7 @@ class OllamaProvider(BaseLLMProvider):
                 raise Exception("Unexpected response format. 'response' field missing.")
         else:
             raise Exception(f"Request failed with status code {response.status_code}")
+
 
     def send_request(self, data):
         headers = {
@@ -1460,16 +1773,30 @@ import requests
 
 from llm_providers.base_provider import BaseLLMProvider
 
-class OpenaiProvider(BaseLLMProvider):
+class OpenaiProvider:
     def __init__(self, api_url, api_key):
-        self.api_key = os.environ.get("OPENAI_API_KEY")
-        self.api_url = "https://api.openai.com/v1/chat/completions"
+        self.api_key = api_key
+        self.api_url = api_url or "https://api.openai.com/v1/chat/completions"
+
+
+    def get_available_models(self):
+        response = requests.get("https://api.openai.com/v1/models", headers={
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        })
+        if response.status_code == 200:
+            models_data = response.json().get("data", [])
+            return {model["id"]: model.get("max_tokens", 4096) for model in models_data}
+        else:
+            raise Exception(f"Failed to retrieve models: {response.status_code}")
+    
 
     def process_response(self, response):
         if response.status_code == 200:
             return response.json()
         else:
             raise Exception(f"Request failed with status code {response.status_code}")
+
 
     def send_request(self, data):
         print("self.api_url: ", self.api_url)
@@ -1577,7 +1904,7 @@ class AgentBaseModel:
             "id": self.id,
             "name": self.name,
             "description": self.description,
-            "tools": [tool.to_dict() for tool in self.tools],
+            'tools': [tool.to_dict() if hasattr(tool, 'to_dict') else tool for tool in self.tools],
             "provider": self.provider,
             "model": self.model,
             "config": self.config,
@@ -1659,6 +1986,16 @@ class AgentBaseModel:
             print(f"  - {param}")
 
         return required_params, optional_params
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __contains__(self, key):
+        return hasattr(self, key)
+
 ```
 
 # AutoGroq\models\project_base_model.py
@@ -1782,7 +2119,7 @@ class ToolBaseModel:
         title: str,
         file_name: str,
         content: str,
-        function: Optional[Callable] = None,  # Add this line
+        function: Optional[Callable] = None,
         id: Optional[int] = None,
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
@@ -1797,12 +2134,12 @@ class ToolBaseModel:
         self.title = title
         self.file_name = file_name
         self.content = content
-        self.function = function  # Add this line
+        self.function = function
         self.created_at = created_at
         self.updated_at = updated_at
         self.user_id = user_id
-        self.secrets = secrets
-        self.libraries = libraries
+        self.secrets = secrets if secrets is not None else []
+        self.libraries = libraries if libraries is not None else []
         self.timestamp = timestamp
 
     def execute(self, *args, **kwargs):
@@ -2013,6 +2350,149 @@ class WorkflowBaseModel:
         )
 ```
 
+# AutoGroq\tools\code_generator.py
+
+```python
+# tools/code_generator.py
+
+import inspect
+import json
+import logging
+from models.tool_base_model import ToolBaseModel
+from utils.api_utils import get_api_key, get_llm_provider
+import streamlit as st
+
+logger = logging.getLogger(__name__)
+
+def generate_code(request: str, language: str = "Python") -> str:
+    logger.debug(f"Generating code for request: {request}")
+    logger.debug(f"Language: {language}")
+    
+    if not request.strip():
+        return "Error: No specific code generation request provided."
+
+    prompt = f"""
+    You are an advanced AI language model with expertise in software development. Your task is to generate the best possible software solution for the following request:
+    **Request:**
+    {request}
+    **Language:**
+    {language}
+    Please ensure that the code follows best practices for {language}, is optimized for performance and maintainability, and includes comprehensive comments explaining each part of the code. Additionally, provide any necessary context or explanations to help understand the implementation. The solution should be robust, scalable, and adhere to industry standards.
+    If there are multiple ways to solve the problem, choose the most efficient and elegant approach. If any libraries or frameworks are beneficial, include their usage with appropriate explanations.
+    Begin your response with a brief overview of the approach you are taking, and then provide the complete code.
+    Example overview: "To solve the problem of {request}, we will implement a {{specific algorithm/pattern}} using {{specific features/libraries of the language}}. This approach ensures {{benefits of the approach}}."
+    Here is the code:
+    """
+
+    api_key = get_api_key()
+    llm_provider = get_llm_provider(api_key=api_key)
+    
+    llm_request_data = {
+        "model": st.session_state.get('model', 'default'),
+        "temperature": st.session_state.get('temperature', 0.7),
+        "max_tokens": st.session_state.get('max_tokens', 2000),
+        "top_p": 1,
+        "frequency_penalty": 0,
+        "presence_penalty": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an expert code generator."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+
+    try:
+        response = llm_provider.send_request(llm_request_data)
+        logger.debug(f"LLM response status code: {response.status_code}")
+        logger.debug(f"LLM response content: {response.text[:500]}...")  # Log first 500 characters of response
+        
+        if response.status_code == 200:
+            response_data = llm_provider.process_response(response)
+            if "choices" in response_data and response_data["choices"]:
+                generated_code = response_data["choices"][0]["message"]["content"]
+                return generated_code.strip()
+            else:
+                return "Error: Unexpected response format from the language model."
+        else:
+            return f"Error: Received status code {response.status_code} from the language model API."
+    except Exception as e:
+        logger.error(f"Error generating code: {str(e)}", exc_info=True)
+        return f"Error generating code: {str(e)}"
+
+code_generator_tool = ToolBaseModel(
+    name="generate_code",
+    description="Generates code for a specified feature in a given programming language.",
+    title="Code Generator",
+    file_name="code_generator.py",
+    content=inspect.getsource(generate_code),
+    function=generate_code,
+)
+
+def get_tool():
+    return code_generator_tool
+```
+
+# AutoGroq\tools\code_test.py
+
+```python
+# tools/code_test.py
+
+import inspect
+import subprocess
+import tempfile
+from models.tool_base_model import ToolBaseModel
+
+def test_code(language: str, code: str, test_cases: str) -> str:
+    """
+    Tests the given code with provided test cases.
+
+    Args:
+        language (str): The programming language of the code (e.g., "Python", "JavaScript").
+        code (str): The code to be tested.
+        test_cases (str): A string containing test cases, each on a new line.
+
+    Returns:
+        str: The test results as a string.
+    """
+    if language.lower() != "python":
+        return f"Testing for {language} is not supported yet."
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+        temp_file.write(code)
+        temp_file.write("\n\n# Test cases\n")
+        temp_file.write(test_cases)
+        temp_file_name = temp_file.name
+
+    try:
+        result = subprocess.run(['python', temp_file_name], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return f"Tests passed successfully.\nOutput:\n{result.stdout}"
+        else:
+            return f"Tests failed.\nError:\n{result.stderr}"
+    except subprocess.TimeoutExpired:
+        return "Test execution timed out."
+    except Exception as e:
+        return f"An error occurred during testing: {str(e)}"
+
+code_test_tool = ToolBaseModel(
+    name="test_code",
+    description="Tests the given code with provided test cases.",
+    title="Code Tester",
+    file_name="code_test.py",
+    content=inspect.getsource(test_code),
+    function=test_code,
+)
+
+def get_tool():
+    return code_test_tool
+
+```
+
 # AutoGroq\tools\fetch_web_content.py
 
 ```python
@@ -2028,7 +2508,7 @@ from models.tool_base_model import ToolBaseModel
 from urllib.parse import urlparse, urlunparse
 
 
-def fetch_web_content(url: str) -> str:
+def fetch_web_content(url: str) -> dict:
     """
     Fetches the text content from a website.
 
@@ -2036,13 +2516,16 @@ def fetch_web_content(url: str) -> str:
         url (str): The URL of the website.
 
     Returns:
-        str: The content of the website, or an error message if fetching failed.
+        dict: A dictionary containing the status, URL, and content (or error message).
     """
     try:
         cleaned_url = clean_url(url)
         logging.info(f"Fetching content from cleaned URL: {cleaned_url}")
         
-        response = requests.get(cleaned_url, timeout=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(cleaned_url, headers=headers, timeout=10)
         response.raise_for_status()
         
         logging.info(f"Response status code: {response.status_code}")
@@ -2050,44 +2533,45 @@ def fetch_web_content(url: str) -> str:
         
         soup = BeautifulSoup(response.text, "html.parser")
         
-        logging.info(f"Parsed HTML structure: {soup.prettify()[:5000]}...")  # Log first 5000 characters of prettified HTML
+        logging.info(f"Parsed HTML structure: {soup.prettify()[:500]}...")  # Log first 500 characters of prettified HTML
         
-        body_content = soup.body
-
-        if body_content:
-            content = body_content.get_text(strip=True)
-            logging.info(f"Extracted text content (first 5000 chars): {content[:5000]}...")
-            result = json.dumps({
-                "status": "success",
-                "url": cleaned_url,
-                "content": content[:5000]  # Limit to first 5000 characters
-            })
-            print(f"DEBUG: fetch_web_content result: {result[:5000]}...")  # Debug print
-            return result
+        # Try to get content from article tags first
+        article_content = soup.find('article')
+        if article_content:
+            content = article_content.get_text(strip=True)
         else:
-            logging.warning(f"No <body> tag found in the content from {cleaned_url}")
-            return json.dumps({
-                "status": "error",
-                "url": cleaned_url,
-                "message": f"No <body> tag found in the content from {cleaned_url}"
-            })
+            # If no article tag, fall back to body content
+            body_content = soup.body
+            if body_content:
+                content = body_content.get_text(strip=True)
+            else:
+                raise ValueError("No content found in the webpage")
+
+        logging.info(f"Extracted text content (first 500 chars): {content[:500]}...")
+        result = {
+            "status": "success",
+            "url": cleaned_url,
+            "content": content  
+        }
+        print(f"DEBUG: fetch_web_content result: {str(result)[:500]}...")  # Debug print
+        return result
 
     except requests.RequestException as e:
         error_message = f"Error fetching content from {cleaned_url}: {str(e)}"
         logging.error(error_message)
-        return json.dumps({
+        return {
             "status": "error",
             "url": cleaned_url,
             "message": error_message
-        })
+        }
     except Exception as e:
         error_message = f"Unexpected error while fetching content from {cleaned_url}: {str(e)}"
         logging.error(error_message)
-        return json.dumps({
+        return {
             "status": "error",
             "url": cleaned_url,
             "message": error_message
-        })
+        }
 
 # Create the ToolBaseModel instance
 fetch_web_content_tool = ToolBaseModel(
@@ -2119,18 +2603,20 @@ def clean_url(url: str) -> str:
         url = 'https://' + url
     parsed = urlparse(url)
     return urlunparse(parsed)
+
 ```
 
 # AutoGroq\utils\agent_utils.py
 
 ```python
+# utils/agent_utils.py
 
 import datetime
 import streamlit as st
 
 from configs.config import LLM_PROVIDER
-from models.tool_base_model import ToolBaseModel
-from utils.text_utils import sanitize_text
+
+from utils.text_utils import normalize_config
 
 
 def create_agent_data(agent):
@@ -2139,53 +2625,23 @@ def create_agent_data(agent):
     current_timestamp = datetime.datetime.now().isoformat()
     provider = agent.get('config', {}).get('provider', st.session_state.get('provider', LLM_PROVIDER))
 
-    formatted_expert_name = sanitize_text(expert_name)
-    formatted_expert_name = formatted_expert_name.lower().replace(' ', '_')
-
-    sanitized_description = sanitize_text(description)
+    # Use normalize_config to get the standardized config
+    normalized_config = normalize_config(agent, expert_name)
 
     autogen_agent_data = {
-        "type": "assistant",
-        "config": {
-            "name": formatted_expert_name,
-            "provider": provider,
-            "llm_config": {
-                "config_list": [
-                    {
-                        "user_id": "default",
-                        "timestamp": current_timestamp,
-                        "model": agent.get('config', {}).get('llm_config', {}).get('config_list', [{}])[0].get('model', 'default'),
-                        "provider": provider,
-                        "base_url": None,
-                        "api_type": None,
-                        "api_version": None,
-                        "description": f"{provider.capitalize()} model configuration"
-                    }
-                ],
-                "temperature": st.session_state.temperature,
-                "cache_seed": None,
-                "timeout": None,
-                "max_tokens": None,
-                "extra_body": None
-            },
-            "human_input_mode": "NEVER",
-            "max_consecutive_auto_reply": 8,
-            "system_message": f"You are a helpful assistant that can act as {expert_name} who {sanitized_description}.",
-            "is_termination_msg": None,
-            "code_execution_config": None,
-            "default_auto_reply": "",
-            "description": description
-        },
-        "timestamp": current_timestamp,
-        "user_id": "default",
+        "name": normalized_config['name'],
+        "description": description,
+        "config": normalized_config,
         "tools": agent.get('tools', []),
-        "role": agent.get('role', expert_name),
-        "goal": agent.get('goal', f"Assist with tasks related to {sanitized_description}"),
-        "backstory": agent.get('backstory', f"As an AI assistant, I specialize in {sanitized_description}")
+        "role": agent.get('role', normalized_config['name']),
+        "goal": agent.get('goal', f"Assist with tasks related to {description}"),
+        "backstory": agent.get('backstory', f"As an AI assistant, I specialize in {description}"),
+        "provider": provider,
+        "model": st.session_state.get('model', 'default')
     }
 
     crewai_agent_data = {
-        "name": expert_name,
+        "name": normalized_config['name'],
         "description": description,
         "verbose": True,
         "allow_delegation": True
@@ -2206,7 +2662,7 @@ import requests
 import streamlit as st
 import time
 
-from configs.config import API_URL, LLM_PROVIDER, RETRY_DELAY, RETRY_TOKEN_LIMIT, SUPPORTED_PROVIDERS
+from configs.config import LLM_PROVIDER, RETRY_DELAY, RETRY_TOKEN_LIMIT
 
 
 def display_api_key_input(provider=None):
@@ -2217,14 +2673,42 @@ def display_api_key_input(provider=None):
     
     if api_key is None:
         st.session_state.warning_placeholder.warning(f"{provider.upper()} API Key not found. Please enter your API key, or select a different provider.")
-        api_key = st.text_input(f"Enter your {provider.upper()} API Key:", type="password", key=f"api_key_input_{provider}")
-        if api_key:
-            st.session_state[api_key_env_var] = api_key
-            os.environ[api_key_env_var] = api_key
-            st.success(f"{provider.upper()} API Key entered successfully.")
-            st.session_state.warning_placeholder.empty()
+    api_key = st.text_input(f"Enter your {provider.upper()} API Key:", type="password", key=f"api_key_input_{provider}")
+    if api_key:
+        st.session_state[api_key_env_var] = api_key
+        os.environ[api_key_env_var] = api_key
+        # st.success(f"{provider.upper()} API Key entered successfully.")
+        st.session_state.warning_placeholder.empty()
     return api_key
 
+
+def fetch_available_models(provider=None):
+    if provider is None:
+        provider = st.session_state.get('provider', LLM_PROVIDER)
+    api_key = get_api_key(provider)
+    llm_provider = get_llm_provider(api_key=api_key, provider=provider)
+    try:
+        models = llm_provider.get_available_models()
+        st.session_state.available_models = models
+        return models
+    except Exception as e:
+        st.error(f"Failed to fetch available models: {str(e)}")
+        return {}
+    
+
+def fetch_available_models(provider=None):
+    if provider is None:
+        provider = st.session_state.get('provider', LLM_PROVIDER)
+    api_key = get_api_key(provider)
+    llm_provider = get_llm_provider(api_key=api_key, provider=provider)
+    try:
+        models = llm_provider.get_available_models()
+        st.session_state.available_models = models
+        return models
+    except Exception as e:
+        st.error(f"Failed to fetch available models: {str(e)}")
+        return {}
+    
 
 def get_api_key(provider=None):
     if provider is None:
@@ -2351,28 +2835,22 @@ def get_api_url():
 # AutoGroq\utils\db_utils.py
 
 ```python
+# db_utils.py
 
 import datetime
 import json
-import os
 import sqlite3
 import streamlit as st
+import traceback
 import uuid
 
-from configs.config import FRAMEWORK_DB_PATH, MODEL_CHOICES, MODEL_TOKEN_LIMITS
+from configs.config import FRAMEWORK_DB_PATH
 
-from utils.agent_utils import create_agent_data
-from utils.file_utils import sanitize_text
+from utils.text_utils import normalize_config
 from utils.workflow_utils import get_workflow_from_agents
 
 
 def export_to_autogen():
-    # Check if the app is running on Streamlit Sharing
-    url_params = st.query_params
-    if "streamlit.app" in url_params.get("url", ""):
-        st.warning("Exporting to Autogen is only possible with a locally running copy of AutoGroq™.")
-        return
-
     db_path = FRAMEWORK_DB_PATH
     print(f"Database path: {db_path}")
     if db_path:
@@ -2390,68 +2868,92 @@ def export_data(db_path):
             cursor = conn.cursor()
             print("Connected to the database successfully.")
 
-            # Access agents from st.session_state
             agents = st.session_state.agents
             print(f"Number of agents: {len(agents)}")
 
-            # Keep track of inserted skills to avoid duplicates
-            inserted_skills = set()
+            for index, agent in enumerate(agents):
+                try:
+                    print(f"Processing agent {index + 1}: {agent.name}")
+                    
+                    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Normalize the config
+                    normalized_config = normalize_config(agent.to_dict(), agent.name)
+                    
+                    agent_data = (
+                        None,  # id (AUTO INCREMENT)
+                        current_time,  # created_at
+                        current_time,  # updated_at
+                        'guestuser@gmail.com',  # user_id
+                        '0.0.1',  # version
+                        'assistant',  # type
+                        json.dumps(normalized_config),  # config (JSON)
+                        normalized_config['system_message']  # task_instruction
+                    )
+                    
+                    print(f"Inserting agent data: {agent_data}")
+                    
+                    cursor.execute("""
+                        INSERT INTO agent (id, created_at, updated_at, user_id, version, type, config, task_instruction) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, agent_data)
+                    
+                    print(f"Inserted agent: {agent.name}")
 
-            for agent in agents:
-                agent_name = agent['config']['name']
-                formatted_agent_name = sanitize_text(agent_name).lower().replace(' ', '_')
-                autogen_agent_data, _ = create_agent_data(agent)
-                
-                # Update the model and max_tokens in the autogen_agent_data
-                autogen_agent_data['config']['llm_config']['config_list'][0]['model'] = agent['config']['llm_config']['config_list'][0]['model']
-                autogen_agent_data['config']['llm_config']['max_tokens'] = MODEL_CHOICES.get(agent['config']['llm_config']['config_list'][0]['model'], MODEL_TOKEN_LIMITS.get(st.session_state.model, 4096))
-                
-                agent_data = (
-                    str(uuid.uuid4()), # Generate a unique ID for the agent
-                    'default',
-                    datetime.datetime.now().isoformat(),
-                    json.dumps(autogen_agent_data['config']),
-                    autogen_agent_data['type'],
-                    json.dumps(autogen_agent_data['tools'])
+                except Exception as e:
+                    print(f"Error processing agent {index + 1}: {str(e)}")
+                    print(f"Agent data: {agent.__dict__}")
+                    traceback.print_exc()
+
+            # Handle skills/tools
+            for tool in st.session_state.tool_models:
+                try:
+                    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    skill_data = (
+                        None,  # id (AUTO INCREMENT)
+                        current_time,  # created_at
+                        current_time,  # updated_at
+                        'guestuser@gmail.com',  # user_id
+                        '0.0.1',  # version
+                        tool.name,
+                        tool.content,
+                        tool.description,
+                        json.dumps(tool.secrets) if hasattr(tool, 'secrets') else '{}',
+                        json.dumps(tool.libraries) if hasattr(tool, 'libraries') else '[]'
+                    )
+                    cursor.execute("""
+                        INSERT INTO skill (id, created_at, updated_at, user_id, version, name, content, description, secrets, libraries)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, skill_data)
+                    print(f"Inserted skill: {tool.name}")
+                except Exception as e:
+                    print(f"Error inserting skill {tool.name}: {str(e)}")
+                    traceback.print_exc()
+
+            # Handle the workflow
+            try:
+                workflow_data, _ = get_workflow_from_agents(agents)
+                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                workflow_insert_data = (
+                    None,  # id (AUTO INCREMENT)
+                    current_time,  # created_at
+                    current_time,  # updated_at
+                    'guestuser@gmail.com',  # user_id
+                    '0.0.1',  # version
+                    workflow_data.get('name', 'AutoGroq Workflow'),
+                    workflow_data.get('description', 'Workflow auto-generated by AutoGroq.'),
+                    workflow_data.get('type', 'autonomous'),  # Default to 'autonomous' if not specified
+                    workflow_data.get('summary_method', 'last')[:4],  # VARCHAR(4)
+                    json.dumps(workflow_data.get('sample_tasks', []))
                 )
-                cursor.execute("INSERT INTO agents (id, user_id, timestamp, config, type, skills) VALUES (?, ?, ?, ?, ?, ?)", agent_data)
-                print(f"Inserted agent: {formatted_agent_name}")
-
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            skill_folder = os.path.join(project_root, "tools")
-            for tool_name in st.session_state.selected_tools:
-                if tool_name not in inserted_skills:
-                    skill_file_path = os.path.join(skill_folder, f"{tool_name}.py")
-                    with open(skill_file_path, 'r') as file:
-                        skill_data = file.read()
-                        skill_json = st.session_state.tool
-                        skill_data = (
-                            str(uuid.uuid4()),  # Generate a unique ID for the skill
-                            'default',  # Set the user ID to 'default'
-                            datetime.datetime.now().isoformat(),
-                            skill_data,
-                            skill_json['title'],
-                            skill_json['file_name']
-                        )
-                        cursor.execute("INSERT INTO skills (id, user_id, timestamp, content, title, file_name) VALUES (?, ?, ?, ?, ?, ?)", skill_data)
-                        print(f"Inserted skill: {skill_json['title']}")
-                        inserted_skills.add(tool_name)  # Add the inserted skill to the set
-
-            # Access agents from st.session_state for workflow
-            workflow_data = get_workflow_from_agents(st.session_state.agents)[0]
-            workflow_data = (
-                str(uuid.uuid4()),  # Generate a unique ID for the workflow
-                'default',
-                datetime.datetime.now().isoformat(),
-                json.dumps(workflow_data['sender']),
-                json.dumps(workflow_data['receiver']),
-                workflow_data['type'],
-                workflow_data['name'],
-                workflow_data['description'],
-                workflow_data['summary_method']
-            )
-            cursor.execute("INSERT INTO workflows (id, user_id, timestamp, sender, receiver, type, name, description, summary_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", workflow_data)
-            print("Inserted workflow data.")
+                cursor.execute("""
+                    INSERT INTO workflow (id, created_at, updated_at, user_id, version, name, description, type, summary_method, sample_tasks)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, workflow_insert_data)
+                print("Inserted workflow data.")
+            except Exception as e:
+                print(f"Error inserting workflow: {str(e)}")
+                traceback.print_exc()
 
             conn.commit()
             print("Changes committed to the database.")
@@ -2463,6 +2965,108 @@ def export_data(db_path):
         except sqlite3.Error as e:
             st.error(f"Error exporting data to Autogen: {str(e)}")
             print(f"Error exporting data to Autogen: {str(e)}")
+            traceback.print_exc()
+
+
+def get_table_info(table_name):
+    conn = sqlite3.connect(FRAMEWORK_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = cursor.fetchall()
+    conn.close()
+    return columns
+
+
+def insert_or_get_skill(cursor, tool):
+    tool_name = tool.name if hasattr(tool, 'name') else tool.get('name', '')
+    cursor.execute("SELECT id FROM skill WHERE name = ?", (tool_name,))
+    result = cursor.fetchone()
+    if result:
+        return result[0]
+    else:
+        print(f"Inserting new skill: {tool}")
+        
+        skill_data = (
+            None,  # id is INTEGER PRIMARY KEY, let SQLite auto-increment
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # created_at
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # updated_at
+            'default',  # user_id
+            '0.0.1',  # version
+            str(tool_name),
+            str(tool.content if hasattr(tool, 'content') else tool.get('content', '')),
+            str(tool.description if hasattr(tool, 'description') else tool.get('description', '')),
+            json.dumps(tool.secrets if hasattr(tool, 'secrets') else tool.get('secrets', {})),
+            json.dumps(tool.libraries if hasattr(tool, 'libraries') else tool.get('libraries', []))
+        )
+        
+        print(f"Skill data to be inserted: {skill_data}")
+        
+        try:
+            cursor.execute("""
+                INSERT INTO skill (id, created_at, updated_at, user_id, version, name, content, description, secrets, libraries) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, skill_data)
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            print(f"SQLite error: {e}")
+            print("Data types:")
+            for i, item in enumerate(skill_data):
+                print(f"  {i}: {type(item)}")
+            raise
+    
+
+def insert_or_get_model(cursor, model_config):
+    cursor.execute("SELECT id FROM model WHERE model = ?", (model_config['model'],))
+    result = cursor.fetchone()
+    if result:
+        return result[0]
+    else:
+        model_data = (
+            str(uuid.uuid4()),  # id
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # created_at
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # updated_at
+            'guestuser@gmail.com',  # user_id
+            '0.0.1',  # version
+            model_config['model'],
+            model_config.get('api_key'),
+            model_config.get('base_url'),
+            model_config.get('api_type', '')[:6],  # VARCHAR(6)
+            model_config.get('api_version'),
+            model_config.get('description', '')
+        )
+        cursor.execute("""
+            INSERT INTO model (id, created_at, updated_at, user_id, version, model, api_key, base_url, api_type, api_version, description) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, model_data)
+        return cursor.lastrowid
+    
+
+def insert_workflow(cursor, workflow_data):
+    workflow_insert_data = (
+        None,  # id is INTEGER PRIMARY KEY, let SQLite auto-increment
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # created_at
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # updated_at
+        'guestuser@gmail.com',  # user_id (matching existing entries)
+        '0.0.1',  # version
+        workflow_data.get('name', 'AutoGroq Workflow'),
+        workflow_data.get('description', 'Workflow auto-generated by AutoGroq.'),
+        workflow_data.get('type', 'groupchat')[:10],  # VARCHAR(10)
+        workflow_data.get('summary_method', 'last')[:4],  # VARCHAR(4)
+        json.dumps(workflow_data.get('sample_tasks', []))
+    )
+    print(f"Inserting workflow data: {workflow_insert_data}")
+    try:
+        cursor.execute("""
+            INSERT INTO workflow (id, created_at, updated_at, user_id, version, name, description, type, summary_method, sample_tasks) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, workflow_insert_data)
+        return cursor.lastrowid
+    except sqlite3.Error as e:
+        print(f"SQLite error: {e}")
+        print("Data types:")
+        for i, item in enumerate(workflow_insert_data):
+            print(f"  {i}: {type(item)}")
+        raise
 
 
 def sql_to_db(sql: str, params: tuple = None):
@@ -2478,14 +3082,14 @@ def sql_to_db(sql: str, params: tuple = None):
         print("SQL executed successfully.")
     except sqlite3.Error as e:
         print(f"Error executing SQL: {str(e)}")
+        print(f"SQL: {sql}")
+        print(f"Params: {params}")
         raise
     finally:
         if conn:
             conn.close()
             print("Database connection closed.")
-
-
-
+            
 
 #FUTURE functions for exporting to new Autogen Studio schema:
 
@@ -2573,11 +3177,10 @@ import json
 import streamlit as st
 import zipfile
 
-from configs.config import MODEL_TOKEN_LIMITS
-
-from utils.agent_utils import create_agent_data
+from utils.db_utils import normalize_config
 from utils.text_utils import sanitize_text
 from utils.workflow_utils import get_workflow_from_agents
+
    
 
 def create_workflow_data(workflow):
@@ -2623,82 +3226,48 @@ def regenerate_zip_files():
 def zip_files_in_memory(workflow_data):
     autogen_zip_buffer = io.BytesIO()
     crewai_zip_buffer = io.BytesIO()
-    try:
-        autogen_file_data = {}
+
+    with zipfile.ZipFile(autogen_zip_buffer, 'w', zipfile.ZIP_DEFLATED) as autogen_zip:
         for agent in st.session_state.agents:
-            agent_name = agent.name
-            formatted_agent_name = sanitize_text(agent_name).lower().replace(' ', '_')
-            agent_file_name = f"{formatted_agent_name}.json"
+            agent_data = agent.to_dict()
+            agent_name = agent_data['name']
+            agent_file_name = f"{agent_name}.json"
+            autogen_zip.writestr(f"agents/{agent_file_name}", json.dumps(agent_data, indent=2))
 
-            # Use the agent-specific model configuration
-            autogen_agent_data, _ = create_agent_data(agent.to_dict())
-            autogen_agent_data['config']['name'] = formatted_agent_name
-            autogen_agent_data['config']['llm_config']['config_list'][0]['model'] = agent.config['llm_config']['config_list'][0]['model']
-            autogen_agent_data['config']['llm_config']['max_tokens'] = agent.config['llm_config'].get('max_tokens', MODEL_TOKEN_LIMITS.get(st.session_state.model, 4096))
-            autogen_agent_data['tools'] = []
+        # Add tools to the zip file
+        for tool in st.session_state.tool_models:
+            tool_data = tool.to_dict()
+            tool_name = tool_data['name']
+            tool_file_name = f"{tool_name}.json"
+            autogen_zip.writestr(f"tools/{tool_file_name}", json.dumps(tool_data, indent=2))
 
-            for tool_model in st.session_state.tool_models:
-                if tool_model.name in st.session_state.selected_tools:
-                    tool_json = {
-                        "name": tool_model.name,
-                        "description": tool_model.description,
-                        "title": tool_model.title,
-                        "file_name": tool_model.file_name,
-                        "content": tool_model.content,
-                        "timestamp": tool_model.timestamp,
-                        "user_id": tool_model.user_id
-                    }
-                    autogen_agent_data['tools'].append(tool_json)
+        # Add workflow data
+        autogen_zip.writestr("workflow.json", json.dumps(workflow_data, indent=2))
 
-            agent_file_data = json.dumps(autogen_agent_data, indent=2)
-            agent_file_data = agent_file_data.encode('utf-8')
-            autogen_file_data[f"agents/{agent_file_name}"] = agent_file_data
+    with zipfile.ZipFile(crewai_zip_buffer, 'w', zipfile.ZIP_DEFLATED) as crewai_zip:
+        for agent in st.session_state.agents:
+            agent_data = normalize_config(agent.to_dict(), agent.name)
+            agent_name = agent_data['name']
+            crewai_agent_data = {
+                "name": agent_name,
+                "description": agent_data.get('description', ''),
+                "verbose": True,
+                "allow_delegation": True
+            }
+            crewai_zip.writestr(f"agents/{agent_name}.json", json.dumps(crewai_agent_data, indent=2))
 
-        for tool_model in st.session_state.tool_models:
-            if tool_model.name in st.session_state.selected_tools:
-                tool_json = json.dumps({
-                    "name": tool_model.name,
-                    "description": tool_model.description,
-                    "title": tool_model.title,
-                    "file_name": tool_model.file_name,
-                    "content": tool_model.content,
-                    "timestamp": tool_model.timestamp,
-                    "user_id": tool_model.user_id
-                }, indent=2)
-                tool_json = tool_json.encode('utf-8')
-                autogen_file_data[f"tools/{tool_model.name}.json"] = tool_json
+    autogen_zip_buffer.seek(0)
+    crewai_zip_buffer.seek(0)
 
-        workflow_file_name = "workflow.json"
-        workflow_file_data = json.dumps(workflow_data, indent=2)
-        workflow_file_data = workflow_file_data.encode('utf-8')
-        autogen_file_data[workflow_file_name] = workflow_file_data
+    return autogen_zip_buffer, crewai_zip_buffer
 
-        crewai_file_data = {}
-        for index, agent in enumerate(st.session_state.agents):
-            agent_name = agent.name
-            formatted_agent_name = sanitize_text(agent_name).lower().replace(' ', '_')
-            crewai_agent_data = create_agent_data(agent.to_dict())[1]
-            crewai_agent_data['name'] = formatted_agent_name
-            agent_file_name = f"{formatted_agent_name}.json"
-            agent_file_data = json.dumps(crewai_agent_data, indent=2)
-            agent_file_data = agent_file_data.encode('utf-8')
-            crewai_file_data[f"agents/{agent_file_name}"] = agent_file_data
-
-        create_zip_file(autogen_zip_buffer, autogen_file_data)
-        create_zip_file(crewai_zip_buffer, crewai_file_data)
-        autogen_zip_buffer.seek(0)
-        crewai_zip_buffer.seek(0)
-        return autogen_zip_buffer, crewai_zip_buffer
-    except Exception as e:
-        print(f"Error creating zip files: {str(e)}")
-        return None, None   
 ```
 
 # AutoGroq\utils\sandbox.py
 
 ```python
-import subprocess
 import os
+import subprocess
 
 def execute_in_sandbox(tool_name, *args):
     # Create a temporary Python file with the tool execution
@@ -2722,6 +3291,9 @@ def execute_in_sandbox(tool_name, *args):
 
 import streamlit as st
 
+from agents.code_developer import CodeDeveloperAgent
+from agents.code_tester import CodeTesterAgent
+from agents.web_content_retriever import WebContentRetrieverAgent
 from configs.config import LLM_PROVIDER, SUPPORTED_PROVIDERS
 from configs.config_sessions import DEFAULT_AGENT_CONFIG
 from configs.current_project import Current_Project
@@ -2736,6 +3308,7 @@ from utils.ui_utils import handle_user_request
 def create_default_agent():
     return AgentBaseModel(**DEFAULT_AGENT_CONFIG)
 
+
 def initialize_session_variables():
 
     if "agent_model" not in st.session_state:
@@ -2746,6 +3319,18 @@ def initialize_session_variables():
 
     if "agents" not in st.session_state:
         st.session_state.agents = []
+
+    # Ensure built-in agents are always present
+    built_in_agents = [
+        WebContentRetrieverAgent.create_default(),
+        CodeDeveloperAgent.create_default(),
+        CodeTesterAgent.create_default()
+    ]
+
+    # Add built-in agents if they're not already in the list
+    for built_in_agent in built_in_agents:
+        if not any(agent.name == built_in_agent.name for agent in st.session_state.agents):
+            st.session_state.agents.append(built_in_agent)
 
     if "api_key" not in st.session_state:
         st.session_state.api_key = ""
@@ -2890,6 +3475,41 @@ def initialize_session_variables():
 ```python
 import re
 
+
+def normalize_config(config, agent_name):
+    """Normalize the config dictionary to match the format of default entries."""
+    normalized = {
+        "name": normalize_name(config.get('name', agent_name)),
+        "human_input_mode": "NEVER",
+        "max_consecutive_auto_reply": 25,
+        "system_message": config.get('system_message', f"You are a helpful AI assistant that can act as {agent_name}."),
+        "is_termination_msg": None,
+        "code_execution_config": "none",
+        "default_auto_reply": "",
+        "description": "Assistant Agent",
+        "llm_config": {
+            "config_list": [],
+            "temperature": 0,
+            "cache_seed": None,
+            "timeout": None,
+            "max_tokens": 2048,
+            "extra_body": None
+        },
+        "admin_name": "Admin",
+        "messages": [],
+        "max_round": 100,
+        "speaker_selection_method": "auto",
+        "allow_repeat_speaker": True
+    }
+    
+    return normalized
+
+
+def normalize_name(name):
+    """Convert name to lowercase and replace spaces with underscores."""
+    return sanitize_text(name).lower().replace(' ', '_')
+
+
 def sanitize_text(text): 
     # Remove non-ASCII characters 
     text = re.sub(r'[^\x00-\x7F]+', '', text) 
@@ -2904,29 +3524,35 @@ def sanitize_text(text):
 # utils/tool_execution.py
 
 import inspect
+import logging
 
 from utils.sandbox import execute_in_sandbox
 
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+
 def execute_tool(tool_name, function_map, *args, **kwargs):
+    logger.debug(f"Attempting to execute tool: {tool_name}")
+    logger.debug(f"Available tools: {list(function_map.keys())}")
+    logger.debug(f"Args: {args}")
+    logger.debug(f"Kwargs: {kwargs}")
+    
     if tool_name not in function_map:
         raise ValueError(f"Tool '{tool_name}' not found in function map")
     
-    return execute_in_sandbox(tool_name, *args)
-
-
-# def execute_tool(tool_name, function_map, *args, **kwargs):
-#     if tool_name not in function_map:
-#         raise ValueError(f"Tool '{tool_name}' not found in function map")
+    tool_function = function_map[tool_name]
+    logger.debug(f"Tool function: {tool_function}")
     
-#     tool_function = function_map[tool_name]
-    
-#     # Check if the function is a method that requires 'self'
-#     if inspect.ismethod(tool_function):
-#         # If it's a method, we need to pass 'self' as the first argument
-#         return tool_function(*args, **kwargs)
-#     else:
-#         # If it's a regular function, we can call it directly
-#         return tool_function(*args, **kwargs)
+    try:
+        result = tool_function(*args, **kwargs)
+        logger.debug(f"Tool execution result: {result[:500]}...")  # Log first 500 characters of result
+        return result
+    except Exception as e:
+        logger.error(f"Error executing tool {tool_name}: {str(e)}", exc_info=True)
+        raise
+
 
 def get_tool_signature(tool_name, function_map):
     if tool_name not in function_map:
@@ -2942,13 +3568,13 @@ def get_tool_signature(tool_name, function_map):
 
 import datetime
 import importlib
+import json
 import os
 import re
 import sqlite3
 import streamlit as st
 import uuid
 
-from configs.config import FRAMEWORK_DB_PATH
 from models.tool_base_model import ToolBaseModel
 from prompts import get_generate_tool_prompt
 from utils.api_utils import get_api_key
@@ -2973,7 +3599,7 @@ def create_tool_data(python_code):
         tool_description = "No description available"
 
     # Get the current timestamp
-    current_timestamp = datetime.datetime.now().isoformat()
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Update st.session_state.tool_model with the tool data
     st.session_state.tool_model.name = function_name
@@ -2982,30 +3608,55 @@ def create_tool_data(python_code):
     st.session_state.tool_model.file_name = f"{function_name}.py"
     st.session_state.tool_model.content = python_code
     st.session_state.tool_model.user_id = "default"
-    st.session_state.tool_model.timestamp = current_timestamp
+    st.session_state.tool_model.created_at = current_time
+    st.session_state.tool_model.updated_at = current_time
+    st.session_state.tool_model.version = "0.0.1"
+
+
+    secrets = []
+    libraries = []
+    
+    # Simple regex to find import statements
+    import_pattern = r'import\s+(\w+)'
+    libraries = re.findall(import_pattern, python_code)
+    
+    # Simple regex to find potential API keys or secrets
+    secret_pattern = r'([A-Z_]+_API_KEY|[A-Z_]+_SECRET)'
+    secrets = re.findall(secret_pattern, python_code)
+    
+    st.session_state.tool_model.secrets = [{"secret": s, "value": None} for s in secrets]
+    st.session_state.tool_model.libraries = libraries
 
 
 def export_tool_as_skill(tool_name: str, edited_skill: str):
     print(f"Exporting skill '{tool_name}'...")
     try:
         create_tool_data(edited_skill)
-        print(f"Skill data: {st.session_state.tool_model.dict()}")  # Use dict() to get the dictionary representation
+        print(f"Skill data: {st.session_state.tool_model.to_dict()}")
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         skill_tuple = (
-            str(uuid.uuid4()),  # Generate a unique ID for the skill
-            'default',  # Set the user ID to 'default'
-            datetime.datetime.now().isoformat(),
-            edited_skill,
-            st.session_state.tool_model.title,
-            st.session_state.tool_model.file_name
+            str(uuid.uuid4()),  # id (TEXT)
+            current_time,  # created_at (TEXT)
+            current_time,  # updated_at (TEXT)
+            'default',  # user_id (TEXT)
+            '0.0.1',  # version (TEXT)
+            tool_name,  # name (TEXT)
+            edited_skill,  # content (TEXT)
+            st.session_state.tool_model.description,  # description (TEXT)
+            json.dumps(st.session_state.tool_model.secrets),  # secrets (TEXT)
+            json.dumps(st.session_state.tool_model.libraries)  # libraries (TEXT)
         )
         print(f"Inserting skill data: {skill_tuple}")
-        sql = "INSERT INTO skills (id, user_id, timestamp, content, title, file_name) VALUES (?, ?, ?, ?, ?, ?)"
+        sql = """
+        INSERT INTO skill (id, created_at, updated_at, user_id, version, name, content, description, secrets, libraries) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
         sql_to_db(sql, skill_tuple)
-        st.success(f"Skill '{tool_name}' exported tool successfully!")
-        st.experimental_rerun()
+        st.success(f"Skill '{tool_name}' exported to Autogen successfully!")
     except sqlite3.Error as e:
         st.error(f"Error exporting skill: {str(e)}")
         print(f"Error exporting skill: {str(e)}")
+        print(f"Skill tuple: {skill_tuple}")  
 
 
 def generate_tool(rephrased_tool_request):  
@@ -3086,9 +3737,9 @@ def load_tool_functions():
     # Debug: Print loaded tools
     for tool in st.session_state.tool_models:
         print(f"Loaded tool model: {tool.name}")
-    for tool_name in st.session_state.tool_functions:
-        print(f"Loaded tool function: {tool_name}")
-
+    for tool_name, tool_function in st.session_state.tool_functions.items():
+        print(f"Loaded tool function: {tool_name} -> {tool_function}")
+        
 
 def populate_tool_models():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3125,17 +3776,11 @@ def populate_tool_models():
 def process_tool_request():
     if st.session_state.tool_request and not st.session_state.get('tool_processed', False):
         tool_request = st.session_state.tool_request
-        parent_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        tool_folder = os.path.join(parent_directory, "tools")
-        print(f"Tool Request: {tool_request}")
         rephrased_tool_request = rephrase_tool(tool_request)
         if rephrased_tool_request:
-            print(f"Generating proposed tool...")
-            proposed_tool, tool_name = generate_tool(rephrased_tool_request)  # Unpack the tuple
-            print(f"Proposed tool: {proposed_tool}")
+            proposed_tool, tool_name = generate_tool(rephrased_tool_request)
             if proposed_tool:
-                match = re.search(r"def\s+(\w+(?:_\w+)*)\(", proposed_tool)  # Updated regex pattern
-                print(f"Match: {match}")
+                match = re.search(r"def\s+(\w+(?:_\w+)*)\(", proposed_tool)
                 if match:
                     tool_name = match.group(1)
                     st.write(f"Proposed tool: {tool_name}")
@@ -3144,29 +3789,29 @@ def process_tool_request():
                     with st.form(key=f"export_form_{tool_name}"):
                         submit_export = st.form_submit_button("Export/Write")
                         if submit_export:
-                            print(f"Exporting tool {tool_name}")
+                            new_tool = ToolBaseModel(
+                                name=tool_name,
+                                description=extract_tool_description(proposed_tool),
+                                title=tool_name,
+                                file_name=f"{tool_name}.py",
+                                content=proposed_tool,
+                                id=len(st.session_state.tool_models) + 1,
+                                created_at=datetime.datetime.now().isoformat(),
+                                updated_at=datetime.datetime.now().isoformat(),
+                                user_id="default",
+                                secrets={},
+                                libraries=[],
+                                timestamp=datetime.datetime.now().isoformat()
+                            )
+                            st.session_state.tool_models.append(new_tool)
+                            st.session_state.selected_tools.append(tool_name)  # Add this line
                             export_tool_as_skill(tool_name, proposed_tool)
-                            st.success(f"tool {tool_name} exported to Autogen successfully!")
-                            # Clear the tool_request input and hide the input field
+                            st.success(f"Tool {tool_name} exported and added to the tool list!")
                             st.session_state.show_tool_input = False
                             st.session_state.tool_request = ""
-                            # Clear the 'proposed_tool' and 'tool_name' from the session state
                             st.session_state.proposed_tool = None
                             st.session_state.tool_name = None
-                            st.session_state.tool_processed = True  # Set the flag to indicate processing is complete
-                            st.experimental_rerun()
-                            
-                    with st.form(key=f"discard_form_{tool_name}"):
-                        submit_discard = st.form_submit_button("Clear")
-                        if submit_discard:
-                            st.warning("tool discarded.")
-                            # Clear the tool_request input and hide the input field
-                            st.session_state.show_tool_input = False
-                            st.session_state.tool_request = ""
-                            # Clear the 'proposed_tool' and 'tool_name' from the session state
-                            st.session_state.proposed_tool = None
-                            st.session_state.tool_name = None
-                            st.session_state.tool_processed = True  # Set the flag to indicate processing is complete
+                            st.session_state.tool_processed = True
                             st.experimental_rerun()
                 else:
                     st.error("Failed to extract tool name from the proposed tool.")
@@ -3223,7 +3868,7 @@ def show_tools():
             if select_all:
                 tool_checkbox = st.checkbox(f"Add {tool_name} tool to all agents", value=True, key=f"tool_{tool_name}_{idx}")
             else:
-                tool_checkbox = st.checkbox(f"Add {tool_name} tool to all agents", value=False, key=f"tool_{tool_name}_{idx}")
+                tool_checkbox = st.checkbox(f"Add {tool_name} tool to all agents", value=tool_name in st.session_state.selected_tools, key=f"tool_{tool_name}_{idx}")
             if tool_checkbox:
                 selected_tools.append(tool_name)
 
@@ -3238,7 +3883,7 @@ def show_tools():
 
         regenerate_zip_files()
 
-        if st.button("Add tool", key="add_tool_button"):
+        if st.button("Add Tool", key="add_tool_button"):
             st.session_state.show_tool_input = True
             st.session_state.tool_request = ""
             st.session_state.tool_processed = False 
@@ -3246,20 +3891,8 @@ def show_tools():
         if st.session_state.get('show_tool_input'):
             tool_request = st.text_input("Need a new tool? Describe what it should do:", key="tool_request_input")
             if tool_request:
-                st.session_state.tool_request = tool_request  # Store in a separate session state variable
-                process_tool_request()  # Pass the tool_request to the process_tool_request function
-
-        if selected_tools or 'proposed_tool' in st.session_state:
-            if st.button("Attempt to Export tool to Autogen (experimental)", key=f"export_button_{st.session_state.tool_name}"):
-                tool_name = st.session_state.tool_name
-                proposed_tool = st.session_state.proposed_tool
-                print(f"Exporting tool {tool_name} to Autogen")
-                export_tool_as_skill(tool_name, proposed_tool)
-                st.success(f"tool {tool_name} exported to Autogen successfully!")
-                # Clear the tool_request input and hide the input field
-                st.session_state.show_tool_input = False
-                st.session_state.tool_request = ""
-                st.experimental_rerun()
+                st.session_state.tool_request = tool_request
+                process_tool_request()
 
 ```
 
@@ -3267,11 +3900,11 @@ def show_tools():
 
 ```python
 import datetime
-import inspect
 import json
 import os
 import pandas as pd
 import re
+import requests
 import streamlit as st
 import time
 
@@ -3280,24 +3913,67 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-from configs.config import (API_URL, DEBUG, LLM_PROVIDER, MAX_RETRIES, 
+from configs.config import (DEBUG, LLM_PROVIDER, MAX_RETRIES, 
         MODEL_CHOICES, MODEL_TOKEN_LIMITS, RETRY_DELAY, SUPPORTED_PROVIDERS)
 
-from agents.web_content_retriever import WebContentRetrieverAgent
-from models.tool_base_model import ToolBaseModel
+from anthropic.types import Message
 from configs.current_project import Current_Project
 from models.agent_base_model import AgentBaseModel
 from models.workflow_base_model import WorkflowBaseModel
 from prompts import create_project_manager_prompt, get_agents_prompt, get_rephrased_user_prompt, get_moderator_prompt  
 from tools.fetch_web_content import fetch_web_content
 from typing import Any, List, Dict, Tuple
-from utils.api_utils import get_api_key, get_llm_provider
+from utils.agent_utils import create_agent_data
+from utils.api_utils import fetch_available_models, get_api_key, get_llm_provider
 from utils.auth_utils import display_api_key_input
 from utils.db_utils import export_to_autogen
 from utils.file_utils import zip_files_in_memory
 from utils.workflow_utils import get_workflow_from_agents
     
+
+def create_agents(json_data: List[Dict[str, Any]]) -> Tuple[List[AgentBaseModel], List[Dict[str, Any]]]:
+    autogen_agents = []
+    crewai_agents = []
     
+    for agent_data in json_data:
+        expert_name = agent_data.get('expert_name', '')
+        description = agent_data.get('description', '')
+        
+        if not expert_name:
+            print("Missing agent name. Skipping...")
+            continue
+
+        autogen_agent_data, crewai_agent_data = create_agent_data({
+            "name": expert_name,
+            "description": description,
+            "role": agent_data.get('role', expert_name),
+            "goal": agent_data.get('goal', f"Assist with tasks related to {description}"),
+            "backstory": agent_data.get('backstory', f"As an AI assistant, I specialize in {description}")
+        })
+        
+        try:
+            agent_model = AgentBaseModel(
+                name=autogen_agent_data['name'],
+                description=autogen_agent_data['description'],
+                tools=autogen_agent_data.get('tools', []),
+                config=autogen_agent_data.get('config', {}),
+                role=autogen_agent_data['role'],
+                goal=autogen_agent_data['goal'],
+                backstory=autogen_agent_data['backstory'],
+                provider=autogen_agent_data.get('provider', ''),
+                model=autogen_agent_data.get('model', '')
+            )
+            print(f"Created agent: {agent_model.name} with description: {agent_model.description}")
+            autogen_agents.append(agent_model)
+            crewai_agents.append(crewai_agent_data)
+        except Exception as e:
+            print(f"Error creating agent {expert_name}: {str(e)}")
+            print(f"Agent data: {autogen_agent_data}")
+            continue
+
+    return autogen_agents, crewai_agents
+
+
 def create_project_manager(rephrased_text):
     print(f"Creating Project Manager")
     temperature_value = st.session_state.get('temperature', 0.1)
@@ -3319,21 +3995,13 @@ def create_project_manager(rephrased_text):
     llm_provider = get_llm_provider(api_key=api_key)
     response = llm_provider.send_request(llm_request_data)
     
-    if response.status_code == 200:
+    if response is not None:
         response_data = llm_provider.process_response(response)
         if "choices" in response_data and response_data["choices"]:
             content = response_data["choices"][0]["message"]["content"]
             return content.strip()
     
     return None
-
-# def display_api_key_input():
-#     llm = LLM_PROVIDER.upper()
-#     api_key = st.text_input(f"Enter your {llm}_API_KEY:", type="password", value="", key="api_key_input")
-#     if api_key:
-#         st.session_state[f"{LLM_PROVIDER.upper()}_API_KEY"] = api_key
-#         st.success("API Key entered successfully.")
-#     return api_key
 
 
 def display_discussion_and_whiteboard():
@@ -3368,12 +4036,21 @@ def display_discussion_and_whiteboard():
             for index, deliverable in enumerate(current_project.deliverables):
                 if deliverable["text"].strip():  # Check if the deliverable text is not empty
                     checkbox_key = f"deliverable_{index}"
-                    done = st.checkbox(deliverable["text"], value=deliverable["done"], key=checkbox_key)
+                    done = st.checkbox(
+                        deliverable["text"], 
+                        value=current_project.is_deliverable_complete(index),
+                        key=checkbox_key,
+                        on_change=update_deliverable_status,
+                        args=(index,)
+                    )
                     if done != deliverable["done"]:
                         if done:
-                            current_project.mark_deliverable_done(index)
+                            current_project.mark_deliverable_phase_done(index, current_project.current_phase)
                         else:
-                            current_project.mark_deliverable_undone(index)
+                            current_project.deliverables[index]["done"] = False
+                            for phase in current_project.implementation_phases:
+                                current_project.deliverables[index]["phase"][phase] = False
+
 
     with tabs[4]:
         display_download_button() 
@@ -3660,7 +4337,31 @@ def extract_code_from_response(response):
 
     return "\n\n".join(unique_code_blocks) 
 
+
+def extract_content(response: Any) -> str:
+    if hasattr(response, 'content') and isinstance(response.content, list):
+        # Anthropic-specific handling
+        return response.content[0].text
+    elif isinstance(response, requests.models.Response):
+        # Groq and potentially other providers using requests.Response
+        try:
+            json_response = response.json()
+            if 'choices' in json_response and json_response['choices']:
+                return json_response['choices'][0]['message']['content']
+        except json.JSONDecodeError:
+            print("Failed to decode JSON from response")
+            return ""
+    elif isinstance(response, dict):
+        if 'choices' in response and response['choices']:
+            return response['choices'][0]['message']['content']
+        elif 'content' in response:
+            return response['content']
+    elif isinstance(response, str):
+        return response
+    print(f"Unexpected response format: {type(response)}")
+    return ""
  
+
 def extract_json_objects(text: str) -> List[Dict]:
     objects = []
     stack = []
@@ -3686,162 +4387,49 @@ def extract_json_objects(text: str) -> List[Dict]:
     return parsed_objects
 
 
-def get_agents_from_text(text: str, max_retries: int = 3, retry_delay: int = 2) -> tuple[List[AgentBaseModel], List[Dict]]:
+def get_agents_from_text(text: str) -> Tuple[List[AgentBaseModel], List[Dict[str, Any]]]:
     print("Getting agents from text...")
-    temperature_value = st.session_state.get('temperature', 0.5)
+    
+    instructions = get_agents_prompt()
+    combined_content = f"{instructions}\n\nTeam of Experts:\n{text}"
+    
     llm_request_data = {
         "model": st.session_state.model,
         "temperature": st.session_state.temperature,
         "max_tokens": st.session_state.max_tokens,
-        "top_p": 1,
-        "stop": "TERMINATE",
         "messages": [
-            {
-                "role": "system",
-                "content": get_agents_prompt()
-            },
-            {
-                "role": "user",
-                "content": text
-            }
+            {"role": "user", "content": combined_content}
         ]
     }
+    
     api_key = get_api_key()
     llm_provider = get_llm_provider(api_key=api_key)
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            response = llm_provider.send_request(llm_request_data)
-            print(f"Response received. Status Code: {response.status_code}")
-            if response.status_code == 200:
-                print("Request successful. Parsing response...")
-                response_data = llm_provider.process_response(response)
-                print(f"Response Data: {json.dumps(response_data, indent=2)}")
-                if "choices" in response_data and response_data["choices"]:
-                    content = response_data["choices"][0]["message"]["content"]
-                    print(f"Content: {content}")
+    
+    try:
+        response = llm_provider.send_request(llm_request_data)
+        print(f"Response type: {type(response)}")
+        print(f"Response: {response}")
 
-                    content = content.replace("\\n", "\n").replace('\\"', '"')
+        content = extract_content(response)
+        
+        if not content:
+            print("No content extracted from response.")
+            return [], []
 
-                    try:
-                        json_data = json.loads(content)
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing JSON: {e}")
-                        print(f"Content: {content}")
-                        json_data = extract_json_objects(content)
+        print(f"Extracted content: {content}")
 
-                    if json_data and isinstance(json_data, list):
-                        autogen_agents = []
-                        crewai_agents = []
-                        for index, agent_data in enumerate(json_data, start=1):
-                            print(f"Processing agent data: {agent_data}")
-                            
-                            expert_name = agent_data.get('expert_name', '')
-                            description = agent_data.get('description', '')
-                            role = agent_data.get('role', expert_name)
-                            goal = agent_data.get('goal', f"Assist with tasks related to {description}")
-                            backstory = agent_data.get('backstory', f"As an AI assistant specializing in {expert_name}, I am equipped with extensive knowledge and expertise in {description}")
-                            
-                            if not expert_name:
-                                print("Missing agent name. Skipping...")
-                                continue
+        json_data = parse_json(content)
+        
+        if not json_data:
+            print("Failed to parse JSON data.")
+            return [], []
 
-                            agent_tools = [tool.to_dict() if isinstance(tool, ToolBaseModel) else tool for tool in st.session_state.selected_tools]
-                            current_timestamp = datetime.datetime.now().isoformat()
-                            
-                            autogen_agent_data = {
-                                "id": index,
-                                "name": expert_name,
-                                "description": description,
-                                "type": "assistant",
-                                "config": {
-                                    "name": expert_name,
-                                    "llm_config": {
-                                        "config_list": [
-                                            {
-                                                "user_id": "default",
-                                                "timestamp": current_timestamp,
-                                                "model": st.session_state.model,
-                                                "base_url": None,
-                                                "api_type": None,
-                                                "api_version": None,
-                                                "description": "OpenAI model configuration"
-                                            }
-                                        ],
-                                        "temperature": st.session_state.temperature,
-                                        "cache_seed": 42,
-                                        "timeout": 600,
-                                        "max_tokens": MODEL_TOKEN_LIMITS.get(st.session_state.model, 4096),
-                                        "extra_body": None
-                                    },
-                                    "human_input_mode": "NEVER",
-                                    "max_consecutive_auto_reply": 8,
-                                    "system_message": f"You are a helpful assistant that can act as {expert_name} who {description}."
-                                },
-                                "tools": agent_tools,
-                                "created_at": current_timestamp,
-                                "updated_at": current_timestamp,
-                                "user_id": "default",
-                                "models": [model for model in MODEL_CHOICES if model != "default"],
-                                "verbose": False,
-                                "allow_delegation": False,
-                                "timestamp": current_timestamp,
-                                "role": role,
-                                "goal": goal,
-                                "backstory": backstory,
-                                "provider": st.session_state.get('provider'),
-                                "model": st.session_state.get('model')
-                            }
-                            
-                            try:
-                                agent_model = AgentBaseModel(**autogen_agent_data)
-                                print(f"Created agent: {agent_model.name} with description: {agent_model.description}")
-                                autogen_agents.append(agent_model)
-                            except Exception as e:
-                                print(f"Error creating agent {expert_name}: {str(e)}")
-                                print(f"Agent data: {autogen_agent_data}")
-                                continue
-
-                            crewai_agent_data = {
-                                "name": expert_name,
-                                "description": description,
-                                "tools": [tool['name'] if isinstance(tool, dict) else tool.name for tool in agent_tools],
-                                "verbose": True,
-                                "allow_delegation": True
-                            }
-                            crewai_agents.append(crewai_agent_data)
-
-                        web_retriever_agent = WebContentRetrieverAgent.create_default()
-                        autogen_agent_data = web_retriever_agent.to_dict()
-                        autogen_agent_data['id'] = len(autogen_agents) + 1
-                        autogen_agents.append(AgentBaseModel(**autogen_agent_data))
-                        crewai_agents.append({
-                            "name": web_retriever_agent.name,
-                            "description": web_retriever_agent.description,
-                            "tools": [tool['name'] for tool in web_retriever_agent.tools],
-                            "verbose": True,
-                            "allow_delegation": True
-                        })
-
-                        print(f"AutoGen Agents: {autogen_agents}")
-                        print(f"CrewAI Agents: {crewai_agents}")
-                        
-                        st.session_state.workflow.agents = autogen_agents
-                        return autogen_agents, crewai_agents
-                    else:
-                        print("Invalid JSON format or empty list. Expected a list of agents.")
-                        return [], []
-                else:
-                    print("No agents data found in response")
-            else:
-                print(f"API request failed with status code {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"Error making API request: {e}")
-            retry_count += 1
-            time.sleep(retry_delay)
-    print(f"Maximum retries ({max_retries}) exceeded. Failed to retrieve valid agent names.")
-    return [], []
-
+        return create_agents(json_data)
+    
+    except Exception as e:
+        print(f"Error in get_agents_from_text: {e}")
+        return [], []
+    
 
 def get_discussion_history():
     return st.session_state.discussion_history
@@ -3943,13 +4531,7 @@ def handle_user_request(session_state):
             break
 
     if team_of_experts_text:
-        required_params, optional_params = AgentBaseModel.debug_init()
-        print(f"Required params: {required_params}")
-        print(f"Optional params: {optional_params}")
         autogen_agents, crewai_agents = get_agents_from_text(team_of_experts_text)
-
-        print(f"Debug: AutoGen Agents: {autogen_agents}")
-        print(f"Debug: CrewAI Agents: {crewai_agents}")
 
         if not autogen_agents:
             print("Error: No agents created.")
@@ -3958,7 +4540,6 @@ def handle_user_request(session_state):
 
         session_state.agents = autogen_agents
         session_state.workflow.agents = session_state.agents
-        print(f"Debug: session_state.workflow.agents: {session_state.workflow.agents}")
 
         # Generate the workflow data
         workflow_data, _ = get_workflow_from_agents(autogen_agents)
@@ -3981,10 +4562,6 @@ def handle_user_request(session_state):
         for agent in workflow_data["receiver"]["groupchat_config"]["agents"]:
             print(agent)
 
-        autogen_zip_buffer, crewai_zip_buffer = zip_files_in_memory(workflow_data)
-        session_state.autogen_zip_buffer = autogen_zip_buffer
-        session_state.crewai_zip_buffer = crewai_zip_buffer
-
         # Indicate that a rerun is needed
         session_state.need_rerun = True
     else:
@@ -3995,12 +4572,25 @@ def handle_user_request(session_state):
 
 def key_prompt():
     api_key = get_api_key()
-    if api_key is None:
-        api_key = display_api_key_input()
+    api_key = display_api_key_input()
     if api_key is None:
         llm = LLM_PROVIDER.upper()
         st.warning(f"{llm}_API_KEY not found, or select a different provider.")
         return
+
+
+def parse_json(content: str) -> List[Dict[str, Any]]:
+    try:
+        json_data = json.loads(content)
+        if isinstance(json_data, list):
+            return json_data
+        else:
+            print("JSON data is not a list as expected.")
+            return []
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON: {e}")
+        print(f"Content: {content}")
+        return []
 
 
 def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, provider=None):
@@ -4009,7 +4599,6 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
     refactoring_prompt = get_rephrased_user_prompt(user_request)
 
     if llm_provider is None:
-        # Use the existing functionality for non-CLI calls
         api_key = get_api_key()
         try:
             llm_provider = get_llm_provider(api_key=api_key, provider=provider)
@@ -4018,7 +4607,7 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
             return None
 
     if max_tokens is None:
-        max_tokens = MODEL_TOKEN_LIMITS.get(model, 4096)
+        max_tokens = llm_provider.get_available_models().get(model, 4096)
 
     llm_request_data = {
         "model": model,
@@ -4044,23 +4633,20 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
         print(f" Messages: {llm_request_data['messages']}")
 
         response = llm_provider.send_request(llm_request_data)
-        print(f"Response received. Status Code: {response.status_code}")
-        print(f"Response Content: {response.text}")
+        
+        if response is None:
+            print("Error: No response received from the LLM provider.")
+            return None
 
-        if response.status_code == 200:
-            print("Request successful. Parsing response...")
-            response_data = llm_provider.process_response(response)
-            print(f"Response Data: {json.dumps(response_data, indent=2)}")
+        print(f"Response received. Processing response...")
+        response_data = llm_provider.process_response(response)
+        print(f"Response Data: {json.dumps(response_data, indent=2)}")
 
-            if "choices" in response_data and len(response_data["choices"]) > 0:
-                rephrased = response_data["choices"][0]["message"]["content"]
-                return rephrased.strip()
-            else:
-                print("Error: Unexpected response format. 'choices' field missing or empty.")
-                return None
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            rephrased = response_data["choices"][0]["message"]["content"]
+            return rephrased.strip()
         else:
-            print(f"Request failed. Status Code: {response.status_code}")
-            print(f"Response Content: {response.text}")
+            print("Error: Unexpected response format. 'choices' field missing or empty.")
             return None
     except Exception as e:
         print(f"An error occurred: {str(e)}")
@@ -4069,8 +4655,16 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
 
 def select_model():
     provider = st.session_state.get('provider', LLM_PROVIDER)
-    provider_models = MODEL_CHOICES[provider]
     
+    if 'available_models' not in st.session_state or not st.session_state.available_models:
+        fetch_available_models(provider)
+    
+    provider_models = st.session_state.available_models
+    
+    if not provider_models:
+        st.warning(f"No models available for {provider}. Please check your API key and connection.")
+        return None
+
     if 'model' not in st.session_state or st.session_state.model not in provider_models:
         default_model = next(iter(provider_models))
     else:
@@ -4108,6 +4702,9 @@ def select_provider():
         api_key = get_api_key(selected_provider)
         if api_key is None:
             display_api_key_input(selected_provider)
+        else:
+            # Fetch available models for the selected provider
+            fetch_available_models(selected_provider)
         
         # Clear the model selection when changing providers
         if 'model' in st.session_state:
@@ -4138,7 +4735,6 @@ def set_temperature():
         "Set Temperature",
         min_value=0.0,
         max_value=1.0,
-        value=st.session_state.get('temperature', 0.3),
         step=0.01,
         key='temperature_slider',
         on_change=update_temperature,
@@ -4156,68 +4752,149 @@ def show_interfaces():
     
     st.markdown('<div class="user-input">', unsafe_allow_html=True)
     auto_moderate = st.checkbox("Auto-moderate (slow, eats tokens, but very cool)", key="auto_moderate", on_change=trigger_moderator_agent_if_checked)
-    if auto_moderate and not st.session_state.get("user_input"):
-        moderator_response = trigger_moderator_agent()
+    if auto_moderate:
+        with st.spinner("Auto-moderating..."):
+            moderator_response = trigger_moderator_agent()
         if moderator_response:
-            st.session_state.user_input = moderator_response
-    user_input, reference_url = display_user_input()
+            if st.session_state.next_agent:
+                st.session_state.user_input = f"To {st.session_state.next_agent}: {moderator_response}"
+            else:
+                st.session_state.user_input = moderator_response
+            st.success("Auto-moderation complete. New input has been generated.")
+        else:
+            st.warning("Auto-moderation failed due to rate limiting. Please wait a moment and try again, or proceed manually.")
+    
+    user_input = st.text_area("Additional Input:", value=st.session_state.user_input, height=200, key="user_input_widget")
+    reference_url = st.text_input("URL:", key="reference_url_widget")
+    
     st.markdown('</div>', unsafe_allow_html=True)
+
+    return user_input, reference_url
 
 
 def trigger_moderator_agent():
-    goal = st.session_state.current_project.re_engineered_prompt
+    current_project = st.session_state.current_project
+    goal = current_project.re_engineered_prompt
     last_speaker = st.session_state.last_agent
     last_comment = st.session_state.last_comment
     discussion_history = st.session_state.discussion_history
 
+    deliverable_index, current_deliverable = current_project.get_next_unchecked_deliverable()
+    
+    if current_deliverable is None:
+        if current_project.current_phase != "Deployment":
+            current_project.move_to_next_phase()
+            st.success(f"Moving to {current_project.current_phase} phase!")
+            deliverable_index, current_deliverable = current_project.get_next_unchecked_deliverable()
+        else:
+            st.success("All deliverables have been completed and deployed!")
+            return None
+
+    current_phase = current_project.get_next_uncompleted_phase(deliverable_index)
+    
     team_members = []
     for agent in st.session_state.agents:
         if isinstance(agent, AgentBaseModel):
-            team_members.append(f"{agent.config['name']}: {agent.description}")
+            team_members.append(f"{agent.name}: {agent.description}")
         else:
             # Fallback for dictionary-like structure
-            team_members.append(f"{agent.get('config', {}).get('name', 'Unknown')}: {agent.get('description', 'No description')}")
+            agent_name = agent.get('config', {}).get('name', agent.get('name', 'Unknown'))
+            agent_description = agent.get('description', 'No description')
+            team_members.append(f"{agent_name}: {agent_description}")
     team_members_str = "\n".join(team_members)
 
-    moderator_prompt = get_moderator_prompt(discussion_history, goal, last_comment, last_speaker, team_members_str)
+    moderator_prompt = get_moderator_prompt(discussion_history, goal, last_comment, last_speaker, team_members_str, current_deliverable, current_phase)
 
-    api_key = get_api_key()
-    llm_provider = get_llm_provider(api_key=api_key)
-    llm_request_data = {
-        "model": st.session_state.model,
-        "temperature": st.session_state.temperature,
-        "max_tokens": st.session_state.max_tokens,
-        "top_p": 1,
-        "stop": "TERMINATE",
-        "messages": [
-            {
-                "role": "user",
-                "content": moderator_prompt
-            }
-        ]
-    }
-    # wait for RETRY_DELAY seconds
-    retry_delay = RETRY_DELAY
-    time.sleep(retry_delay)
-    response = llm_provider.send_request(llm_request_data)
+    for attempt in range(MAX_RETRIES):
+        api_key = get_api_key()
+        llm_provider = get_llm_provider(api_key=api_key)
+        llm_request_data = {
+            "model": st.session_state.model,
+            "temperature": st.session_state.temperature,
+            "max_tokens": st.session_state.max_tokens,
+            "top_p": 1,
+            "stop": "TERMINATE",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": moderator_prompt
+                }
+            ]
+        }
+        retry_delay = RETRY_DELAY
+        time.sleep(retry_delay)
+        response = llm_provider.send_request(llm_request_data)
 
-    if response.status_code == 200:
-        response_data = llm_provider.process_response(response)
-        if "choices" in response_data and response_data["choices"]:
-            content = response_data["choices"][0]["message"]["content"]
+        if isinstance(response, dict) and 'choices' in response:
+            # Handle response from providers like Groq
+            content = response['choices'][0]['message']['content']
+        elif hasattr(response, 'content') and isinstance(response.content, list):
+            # Handle Anthropic-style response
+            content = response.content[0].text
+        else:
+            print(f"Unexpected response format: {type(response)}")
+            continue
+
+        if content:
+            # Extract the agent name from the content
+            agent_name_match = re.match(r"To (\w+( \w+)*):", content)
+            if agent_name_match:
+                next_agent = agent_name_match.group(1)
+                # Check if the extracted name is a valid agent and not a tool
+                if any(agent.name.lower() == next_agent.lower() for agent in st.session_state.agents):
+                    st.session_state.next_agent = next_agent
+                    # Remove the "To [Agent Name]:" prefix from the content
+                    content = re.sub(r"^To \w+( \w+)*:\s*", "", content).strip()
+                else:
+                    st.warning(f"'{next_agent}' is not a valid agent. Please select a valid agent.")
+                    st.session_state.next_agent = None
+            else:
+                st.session_state.next_agent = None
+            
+            if "PHASE_COMPLETED" in content:
+                current_project.mark_deliverable_phase_done(deliverable_index, current_phase)
+                content = content.replace("PHASE_COMPLETED", "").strip()
+                st.success(f"Phase {current_phase} completed for deliverable: {current_deliverable}")
+            
+            if "DELIVERABLE_COMPLETED" in content:
+                current_project.mark_deliverable_done(deliverable_index)
+                content = content.replace("DELIVERABLE_COMPLETED", "").strip()
+                st.success(f"Deliverable completed: {current_deliverable}")
+            
             return content.strip()
 
+    logger.error("All retry attempts failed.")
     return None
 
 
 def trigger_moderator_agent_if_checked():
     if st.session_state.get("auto_moderate", False):
-        trigger_moderator_agent()
+        with st.spinner("Auto-moderating..."):
+            moderator_response = trigger_moderator_agent()
+        if moderator_response:
+            st.session_state.user_input = moderator_response
+            st.success("Auto-moderation complete. New input has been generated.")
+        else:
+            st.warning("Auto-moderation did not produce a response. Please try again or proceed manually.")
+    st.experimental_rerun()
 
 
 def update_api_url(provider):
     api_url_key = f"{provider.upper()}_API_URL"
     st.session_state.api_url = st.session_state.get(api_url_key)
+
+
+def update_deliverable_status(index):
+    current_project = st.session_state.current_project
+    is_checked = st.session_state[f"deliverable_{index}"]
+    if is_checked:
+        for phase in current_project.implementation_phases:
+            current_project.mark_deliverable_phase_done(index, phase)
+    else:
+        current_project.deliverables[index]["done"] = False
+        for phase in current_project.implementation_phases:
+            current_project.deliverables[index]["phase"][phase] = False
+    st.experimental_rerun()
 
 
 def update_discussion_and_whiteboard(agent_name, response, user_input):
@@ -4250,7 +4927,7 @@ def update_user_input():
 # AutoGroq\utils\workflow_utils.py
 
 ```python
-
+# utils/workflow_utils.py
 import datetime
 import streamlit as st
 
@@ -4258,7 +4935,7 @@ from configs.config import MODEL_TOKEN_LIMITS
 
 from tools.fetch_web_content import fetch_web_content_tool
 from utils.agent_utils import create_agent_data
-from utils.file_utils import sanitize_text
+from utils.text_utils import sanitize_text
 
 
 def get_workflow_from_agents(agents):
@@ -4331,10 +5008,11 @@ def get_workflow_from_agents(agents):
             "user_id": "default",
             "tools": []
         },
-        "type": "groupchat",
+        "type": "autonomous",
         "user_id": "default",
         "timestamp": current_timestamp,
-        "summary_method": "last"
+        "summary_method": "last",
+        "sample_tasks": [],
     }
 
     for index, agent in enumerate(agents):

@@ -3,18 +3,19 @@
 import base64
 import json
 import logging
-import os
+import os   
 import re
+import requests
 import streamlit as st
 
-from configs.config import LLM_PROVIDER, MODEL_CHOICES, MODEL_TOKEN_LIMITS
+from configs.config import BUILT_IN_AGENTS, LLM_PROVIDER, FALLBACK_MODEL_TOKEN_LIMITS, SUPPORTED_PROVIDERS
 
 from models.agent_base_model import AgentBaseModel
 from models.tool_base_model import ToolBaseModel
-from tools.fetch_web_content import fetch_web_content
-from utils.api_utils import get_api_key
-from utils.error_handling import log_error, log_tool_execution
-from utils.ui_utils import get_llm_provider, get_provider_models, update_discussion_and_whiteboard
+from utils.api_utils import fetch_available_models, get_api_key
+from utils.error_handling import log_error
+from utils.tool_utils import populate_tool_models, show_tools
+from utils.ui_utils import display_goal, get_llm_provider, update_discussion_and_whiteboard
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ def agent_button_callback(agent_index):
         # Directly call process_agent_interaction here if appropriate
         process_agent_interaction(agent_index)
     return callback
+
 
 def construct_request(agent, agent_name, description, user_request, user_input, rephrased_request, reference_url, tool_results):
     request = f"Act as the {agent_name} who {description}."
@@ -80,38 +82,65 @@ def construct_request(agent, agent_name, description, user_request, user_input, 
 
 
 def display_agents():
-    if "agents" in st.session_state and st.session_state.agents and len(st.session_state.agents) > 0:
-        st.sidebar.title("Your Agents")
-        st.sidebar.subheader("Click to interact")
-        
-        for index, agent in enumerate(st.session_state.agents):
-            agent_name = agent.name
-            col1, col2 = st.sidebar.columns([1, 4])
-            with col1:
-                gear_icon = "⚙️"
-                if st.button(gear_icon, key=f"gear_{index}", help="Edit Agent"):
-                    st.session_state['edit_agent_index'] = index
-                    st.session_state[f'show_edit_{index}'] = not st.session_state.get(f'show_edit_{index}', False)
-            with col2:
-                if "next_agent" in st.session_state and st.session_state.next_agent == agent_name:
-                    button_style = """
-                    <style>
-                    div[data-testid*="stButton"] > button[kind="secondary"] {
-                        background-color: green !important;
-                        color: white !important;
-                    }
-                    </style>
-                    """
-                    st.markdown(button_style, unsafe_allow_html=True)
-                st.button(agent_name, key=f"agent_{index}", on_click=agent_button_callback(index))
-            
-            if st.session_state.get(f'show_edit_{index}', False):
-                display_agent_edit_form(agent, index)
-
-    else:
+    if "agents" in st.session_state and st.session_state.agents and len(st.session_state.agents) == 3:
         st.sidebar.warning(f"No agents have yet been created. Please enter a new request.")
         st.sidebar.warning(f"ALSO: If no agents are created, do a hard reset (CTL-F5) and try switching models. LLM results can be unpredictable.")
         st.sidebar.warning(f"SOURCE:  https://github.com/jgravelle/AutoGroq\n\r\n\r https://j.gravelle.us\n\r\n\r DISCORD: https://discord.gg/DXjFPX84gs \n\r\n\r YouTube: https://www.youtube.com/playlist?list=PLPu97iZ5SLTsGX3WWJjQ5GNHy7ZX66ryP")
+
+    else:
+        st.sidebar.title("Your Agents")
+        st.sidebar.subheader("Click to interact")
+        
+        dynamic_agents_exist = False
+        built_in_agents = []
+
+        # First pass: Identify if there are any dynamic agents and collect built-in agents
+        for index, agent in enumerate(st.session_state.agents):
+            if agent.name not in BUILT_IN_AGENTS:
+                dynamic_agents_exist = True
+            else:
+                built_in_agents.append((agent, index))
+
+        # Display dynamically created agents
+        for index, agent in enumerate(st.session_state.agents):
+            if agent.name not in BUILT_IN_AGENTS:
+                display_agent_button(agent, index)
+
+        # Display built-in agents only if dynamic agents exist
+        if dynamic_agents_exist and built_in_agents:
+            st.sidebar.markdown("---")
+            st.sidebar.markdown("Built-in Agents:")
+            for agent, index in built_in_agents:
+                display_agent_button(agent, index)
+            display_goal()
+            populate_tool_models()
+            show_tools()
+        else:
+            st.empty()
+
+
+def display_agent_button(agent, index):
+    col1, col2 = st.sidebar.columns([1, 4])
+    with col1:
+        gear_icon = "⚙️"
+        if st.button(gear_icon, key=f"gear_{index}", help="Edit Agent"):
+            st.session_state['edit_agent_index'] = index
+            st.session_state[f'show_edit_{index}'] = not st.session_state.get(f'show_edit_{index}', False)
+    with col2:
+        if "next_agent" in st.session_state and st.session_state.next_agent == agent.name:
+            button_style = """
+            <style>
+            div[data-testid*="stButton"] > button[kind="secondary"] {
+                background-color: green !important;
+                color: white !important;
+            }
+            </style>
+            """
+            st.markdown(button_style, unsafe_allow_html=True)
+        st.button(agent.name, key=f"agent_{index}", on_click=agent_button_callback(index))
+    
+    if st.session_state.get(f'show_edit_{index}', False):
+        display_agent_edit_form(agent, index)
 
 
 def display_agent_buttons(agents):
@@ -175,30 +204,46 @@ def display_agent_edit_form(agent, edit_index):
             current_provider = agent.provider or st.session_state.get('provider')
             selected_provider = st.selectbox(
                 "Provider",
-                options=MODEL_CHOICES.keys(),
-                index=list(MODEL_CHOICES.keys()).index(current_provider),
+                options=SUPPORTED_PROVIDERS,
+                index=SUPPORTED_PROVIDERS.index(current_provider),
                 key=f"provider_select_{edit_index}_{agent.name}"
             )
 
-            provider_models = get_provider_models(selected_provider)
-            current_model = agent.model or st.session_state.get('model')
+            # Fetch available models for the selected provider
+            with st.spinner(f"Fetching models for {selected_provider}..."):
+                provider_models = fetch_available_models(selected_provider)
+            
+            if not provider_models:
+                st.warning(f"No models available for {selected_provider}. Using fallback list.")
+                provider_models = FALLBACK_MODEL_TOKEN_LIMITS.get(selected_provider, {})
+
+            current_model = agent.model or st.session_state.get('model', 'default')
             
             if current_model not in provider_models:
-                st.warning(f"Current model '{current_model}' is not available for the selected provider. Please select a new model.")
-                current_model = next(iter(provider_models))  # Set to first available model
+                st.warning(f"Current model '{current_model}' is not available for {selected_provider}. Please select a new model.")
+                current_model = next(iter(provider_models)) if provider_models else None
             
-            selected_model = st.selectbox(
-                "Model", 
-                options=list(provider_models.keys()),
-                index=list(provider_models.keys()).index(current_model),
-                key=f"model_select_{edit_index}_{agent.name}"
-            )
+            if provider_models:
+                selected_model = st.selectbox(
+                    "Model", 
+                    options=list(provider_models.keys()),
+                    index=list(provider_models.keys()).index(current_model) if current_model in provider_models else 0,
+                    key=f"model_select_{edit_index}_{agent.name}"
+                )
+            else:
+                st.error(f"No models available for {selected_provider}.")
+                selected_model = None
+
         with col2:
             if st.button("Set for ALL agents", key=f"set_all_agents_{edit_index}_{agent.name}"):
                 for agent in st.session_state.agents:
                     agent.config['provider'] = selected_provider
+                    if 'llm_config' not in agent.config:
+                        agent.config['llm_config'] = {'config_list': [{}]}
+                    if not agent.config['llm_config']['config_list']:
+                        agent.config['llm_config']['config_list'] = [{}]
                     agent.config['llm_config']['config_list'][0]['model'] = selected_model
-                    agent.config['llm_config']['max_tokens'] = provider_models[selected_model]
+                    agent.config['llm_config']['max_tokens'] = provider_models.get(selected_model, 4096)
                 st.experimental_rerun()
         
         # Display the description in a text area
@@ -226,11 +271,15 @@ def display_agent_edit_form(agent, edit_index):
                 
                 # Update the config as well
                 agent.config['provider'] = selected_provider
+                if 'llm_config' not in agent.config:
+                    agent.config['llm_config'] = {'config_list': [{}]}
+                if not agent.config['llm_config']['config_list']:
+                    agent.config['llm_config']['config_list'] = [{}]
                 agent.config['llm_config']['config_list'][0]['model'] = selected_model
-                agent.config['llm_config']['max_tokens'] = provider_models[selected_model]
+                agent.config['llm_config']['max_tokens'] = provider_models.get(selected_model, 4096)
                 
                 st.session_state[f'show_edit_{edit_index}'] = False
-           
+            
                 if 'edit_agent_index' in st.session_state:
                     del st.session_state['edit_agent_index']
                 st.session_state.agents[edit_index] = agent
@@ -238,6 +287,7 @@ def display_agent_edit_form(agent, edit_index):
 
     # Add a debug print to check the agent's description
     print(f"Agent {agent.name} description: {agent.description}")
+
 
 def download_agent_file(expert_name):
     # Format the expert_name
@@ -260,8 +310,29 @@ def download_agent_file(expert_name):
         st.error(f"File not found: {json_file}")
 
 
+def extract_content(response):
+    if isinstance(response, dict) and 'choices' in response:
+        # Handle response from providers like Groq
+        return response['choices'][0]['message']['content']
+    elif hasattr(response, 'content') and isinstance(response.content, list):
+        # Handle Anthropic-style response
+        return response.content[0].text
+    elif isinstance(response, requests.models.Response):
+        # Handle response from providers using requests.Response
+        try:
+            json_response = response.json()
+            if 'choices' in json_response and json_response['choices']:
+                return json_response['choices'][0]['message']['content']
+        except json.JSONDecodeError:
+            logger.error("Failed to decode JSON from response")
+    logger.error(f"Unexpected response format: {type(response)}")
+    return None
+
+
 def process_agent_interaction(agent_index):
     agent = st.session_state.agents[agent_index]
+    logger.debug(f"Processing interaction for agent: {agent.name}")
+    logger.debug(f"Agent tools: {agent.tools}")
     
     if isinstance(agent, AgentBaseModel):
         agent_name = agent.name
@@ -282,45 +353,36 @@ def process_agent_interaction(agent_index):
     tool_results = {}
     for tool in agent_tools:
         try:
-            logger.debug(f"Executing tool: {tool.name if isinstance(tool, ToolBaseModel) else tool['name']}")
-            if isinstance(tool, ToolBaseModel):
+            logger.debug(f"Executing tool: {tool.name}")
+            if tool.name in st.session_state.tool_functions:
+                tool_function = st.session_state.tool_functions[tool.name]
                 if tool.name == 'fetch_web_content' and reference_url:
-                    tool_result = tool.execute(reference_url)
+                    tool_result = tool_function(reference_url)
+                elif tool.name == 'generate_code':
+                    tool_result = tool_function(user_input or user_request or rephrased_request)
                 else:
-                    tool_result = tool.execute()
+                    tool_result = tool_function(user_input or user_request or rephrased_request)
+                logger.debug(f"Tool result: {tool_result[:500]}...")  # Log first 500 characters of result
             else:
-                # Handle the case where tool is a dictionary
-                if tool['name'] == 'fetch_web_content' and reference_url:
-                    tool_result = fetch_web_content(reference_url)
-                else:
-                    # You might need to implement a way to execute other tools here
-                    tool_result = "Tool execution not implemented for dictionary-based tools"
+                logger.error(f"Tool function not found for {tool.name}")
+                tool_result = f"Error: Tool function not found for {tool.name}"
             
-            tool_name = tool.name if isinstance(tool, ToolBaseModel) else tool['name']
-            tool_results[tool_name] = tool_result
+            tool_results[tool.name] = tool_result
             
-            logger.debug(f"Tool result for {tool_name}: {tool_result[:500]}...")
+            logger.debug(f"Tool result for {tool.name}: {tool_result[:500]}...")
             
-            # Parse the JSON result
-            result_dict = json.loads(tool_result)
-            if result_dict['status'] == 'success':
-                content = f"Successfully fetched content from {result_dict['url']}:\n\n{result_dict['content'][:1000]}..." # Limit to first 1000 characters
-                st.session_state.tool_result_string = content
-            else:
-                content = f"Error fetching content: {result_dict['message']}"
-                st.session_state.tool_result_string = content
-            
-            logger.debug(f"tool_result_string set to: {st.session_state.tool_result_string[:500]}...")
+            # Update the tool_result_string in the session state
+            st.session_state.tool_result_string = tool_result[:1000] + "..."  # Limit to first 1000 characters
             
             # Update the discussion and whiteboard immediately
-            update_discussion_and_whiteboard("Web Content Retriever", content, "")
+            update_discussion_and_whiteboard(tool.name, st.session_state.tool_result_string, "")
             
         except Exception as e:
-            error_message = f"Error executing tool {tool.name if isinstance(tool, ToolBaseModel) else tool['name']}: {str(e)}"
-            logger.error(error_message)
-            tool_results[tool.name if isinstance(tool, ToolBaseModel) else tool['name']] = error_message
+            error_message = f"Error executing tool {tool.name}: {str(e)}"
+            logger.error(error_message, exc_info=True)
+            tool_results[tool.name] = error_message
             st.session_state.tool_result_string = error_message
-            update_discussion_and_whiteboard("Web Content Retriever", error_message, "")
+            update_discussion_and_whiteboard(tool.name, error_message, "")
     
     request = construct_request(agent, agent_name, description, user_request, user_input, rephrased_request, reference_url, tool_results)
     
@@ -341,7 +403,7 @@ def process_agent_interaction(agent_index):
     llm_request_data = {
         "model": model,
         "temperature": st.session_state.temperature,
-        "max_tokens": MODEL_TOKEN_LIMITS.get(model, 4096),
+        "max_tokens": FALLBACK_MODEL_TOKEN_LIMITS.get(model, 4096),
         "top_p": 1,
         "stop": "TERMINATE",
         "messages": [
@@ -354,23 +416,19 @@ def process_agent_interaction(agent_index):
     logger.debug(f"Sending request to {provider} using model {model}")
     response = llm_provider.send_request(llm_request_data)
     
-    if response.status_code == 200:
-        response_data = llm_provider.process_response(response)
-        if "choices" in response_data and response_data["choices"]:
-            content = response_data["choices"][0]["message"]["content"]
-            
-            # Update the most recent response
-            st.session_state.most_recent_response = f"{agent_name}:\n\n{content}\n\n"
-            
-            update_discussion_and_whiteboard(agent_name, content, user_input)
-            st.session_state['form_agent_name'] = agent_name
-            st.session_state['form_agent_description'] = description
-            st.session_state['selected_agent_index'] = agent_index
+    content = extract_content(response)
+    if content:
+        update_discussion_and_whiteboard(agent_name, content, user_input)
+        st.session_state['form_agent_name'] = agent_name
+        st.session_state['form_agent_description'] = description
+        st.session_state['selected_agent_index'] = agent_index
     else:
-        error_message = f"Error: Received status code {response.status_code}"
+        error_message = f"Error: Failed to extract content from response"
         log_error(error_message)
-        print(error_message)
-        print(f"Response: {response.text}")
+        logger.error(error_message)
+
+    # Force a rerun to update the UI and trigger the moderator if necessary
+    st.experimental_rerun()
 
 
 def regenerate_agent_description(agent):

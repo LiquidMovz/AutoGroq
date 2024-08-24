@@ -1,9 +1,9 @@
 import datetime
-import inspect
 import json
 import os
 import pandas as pd
 import re
+import requests
 import streamlit as st
 import time
 
@@ -12,24 +12,67 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-from configs.config import (API_URL, DEBUG, LLM_PROVIDER, MAX_RETRIES, 
-        MODEL_CHOICES, MODEL_TOKEN_LIMITS, RETRY_DELAY, SUPPORTED_PROVIDERS)
+from configs.config import (DEBUG, LLM_PROVIDER, MAX_RETRIES, 
+        FALLBACK_MODEL_TOKEN_LIMITS, RETRY_DELAY, SUPPORTED_PROVIDERS)
 
-from agents.web_content_retriever import WebContentRetrieverAgent
-from models.tool_base_model import ToolBaseModel
+from anthropic.types import Message
 from configs.current_project import Current_Project
 from models.agent_base_model import AgentBaseModel
 from models.workflow_base_model import WorkflowBaseModel
 from prompts import create_project_manager_prompt, get_agents_prompt, get_rephrased_user_prompt, get_moderator_prompt  
 from tools.fetch_web_content import fetch_web_content
 from typing import Any, List, Dict, Tuple
-from utils.api_utils import get_api_key, get_llm_provider
+from utils.agent_utils import create_agent_data
+from utils.api_utils import fetch_available_models, get_api_key, get_llm_provider
 from utils.auth_utils import display_api_key_input
 from utils.db_utils import export_to_autogen
 from utils.file_utils import zip_files_in_memory
 from utils.workflow_utils import get_workflow_from_agents
     
+
+def create_agents(json_data: List[Dict[str, Any]]) -> Tuple[List[AgentBaseModel], List[Dict[str, Any]]]:
+    autogen_agents = []
+    crewai_agents = []
     
+    for agent_data in json_data:
+        expert_name = agent_data.get('expert_name', '')
+        description = agent_data.get('description', '')
+        
+        if not expert_name:
+            print("Missing agent name. Skipping...")
+            continue
+
+        autogen_agent_data, crewai_agent_data = create_agent_data({
+            "name": expert_name,
+            "description": description,
+            "role": agent_data.get('role', expert_name),
+            "goal": agent_data.get('goal', f"Assist with tasks related to {description}"),
+            "backstory": agent_data.get('backstory', f"As an AI assistant, I specialize in {description}")
+        })
+        
+        try:
+            agent_model = AgentBaseModel(
+                name=autogen_agent_data['name'],
+                description=autogen_agent_data['description'],
+                tools=autogen_agent_data.get('tools', []),
+                config=autogen_agent_data.get('config', {}),
+                role=autogen_agent_data['role'],
+                goal=autogen_agent_data['goal'],
+                backstory=autogen_agent_data['backstory'],
+                provider=autogen_agent_data.get('provider', ''),
+                model=autogen_agent_data.get('model', '')
+            )
+            print(f"Created agent: {agent_model.name} with description: {agent_model.description}")
+            autogen_agents.append(agent_model)
+            crewai_agents.append(crewai_agent_data)
+        except Exception as e:
+            print(f"Error creating agent {expert_name}: {str(e)}")
+            print(f"Agent data: {autogen_agent_data}")
+            continue
+
+    return autogen_agents, crewai_agents
+
+
 def create_project_manager(rephrased_text):
     print(f"Creating Project Manager")
     temperature_value = st.session_state.get('temperature', 0.1)
@@ -51,21 +94,13 @@ def create_project_manager(rephrased_text):
     llm_provider = get_llm_provider(api_key=api_key)
     response = llm_provider.send_request(llm_request_data)
     
-    if response.status_code == 200:
+    if response is not None:
         response_data = llm_provider.process_response(response)
         if "choices" in response_data and response_data["choices"]:
             content = response_data["choices"][0]["message"]["content"]
             return content.strip()
     
     return None
-
-# def display_api_key_input():
-#     llm = LLM_PROVIDER.upper()
-#     api_key = st.text_input(f"Enter your {llm}_API_KEY:", type="password", value="", key="api_key_input")
-#     if api_key:
-#         st.session_state[f"{LLM_PROVIDER.upper()}_API_KEY"] = api_key
-#         st.success("API Key entered successfully.")
-#     return api_key
 
 
 def display_discussion_and_whiteboard():
@@ -100,12 +135,21 @@ def display_discussion_and_whiteboard():
             for index, deliverable in enumerate(current_project.deliverables):
                 if deliverable["text"].strip():  # Check if the deliverable text is not empty
                     checkbox_key = f"deliverable_{index}"
-                    done = st.checkbox(deliverable["text"], value=deliverable["done"], key=checkbox_key)
+                    done = st.checkbox(
+                        deliverable["text"], 
+                        value=current_project.is_deliverable_complete(index),
+                        key=checkbox_key,
+                        on_change=update_deliverable_status,
+                        args=(index,)
+                    )
                     if done != deliverable["done"]:
                         if done:
-                            current_project.mark_deliverable_done(index)
+                            current_project.mark_deliverable_phase_done(index, current_project.current_phase)
                         else:
-                            current_project.mark_deliverable_undone(index)
+                            current_project.deliverables[index]["done"] = False
+                            for phase in current_project.implementation_phases:
+                                current_project.deliverables[index]["phase"][phase] = False
+
 
     with tabs[4]:
         display_download_button() 
@@ -392,7 +436,31 @@ def extract_code_from_response(response):
 
     return "\n\n".join(unique_code_blocks) 
 
+
+def extract_content(response: Any) -> str:
+    if hasattr(response, 'content') and isinstance(response.content, list):
+        # Anthropic-specific handling
+        return response.content[0].text
+    elif isinstance(response, requests.models.Response):
+        # Groq and potentially other providers using requests.Response
+        try:
+            json_response = response.json()
+            if 'choices' in json_response and json_response['choices']:
+                return json_response['choices'][0]['message']['content']
+        except json.JSONDecodeError:
+            print("Failed to decode JSON from response")
+            return ""
+    elif isinstance(response, dict):
+        if 'choices' in response and response['choices']:
+            return response['choices'][0]['message']['content']
+        elif 'content' in response:
+            return response['content']
+    elif isinstance(response, str):
+        return response
+    print(f"Unexpected response format: {type(response)}")
+    return ""
  
+
 def extract_json_objects(text: str) -> List[Dict]:
     objects = []
     stack = []
@@ -418,171 +486,59 @@ def extract_json_objects(text: str) -> List[Dict]:
     return parsed_objects
 
 
-def get_agents_from_text(text: str, max_retries: int = 3, retry_delay: int = 2) -> tuple[List[AgentBaseModel], List[Dict]]:
+def get_agents_from_text(text: str) -> Tuple[List[AgentBaseModel], List[Dict[str, Any]]]:
     print("Getting agents from text...")
-    temperature_value = st.session_state.get('temperature', 0.5)
+    
+    instructions = get_agents_prompt()
+    combined_content = f"{instructions}\n\nTeam of Experts:\n{text}"
+    
     llm_request_data = {
         "model": st.session_state.model,
         "temperature": st.session_state.temperature,
         "max_tokens": st.session_state.max_tokens,
-        "top_p": 1,
-        "stop": "TERMINATE",
         "messages": [
-            {
-                "role": "system",
-                "content": get_agents_prompt()
-            },
-            {
-                "role": "user",
-                "content": text
-            }
+            {"role": "user", "content": combined_content}
         ]
     }
+    
     api_key = get_api_key()
     llm_provider = get_llm_provider(api_key=api_key)
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            response = llm_provider.send_request(llm_request_data)
-            print(f"Response received. Status Code: {response.status_code}")
-            if response.status_code == 200:
-                print("Request successful. Parsing response...")
-                response_data = llm_provider.process_response(response)
-                print(f"Response Data: {json.dumps(response_data, indent=2)}")
-                if "choices" in response_data and response_data["choices"]:
-                    content = response_data["choices"][0]["message"]["content"]
-                    print(f"Content: {content}")
+    
+    try:
+        response = llm_provider.send_request(llm_request_data)
+        print(f"Response type: {type(response)}")
+        print(f"Response: {response}")
 
-                    content = content.replace("\\n", "\n").replace('\\"', '"')
+        content = extract_content(response)
+        
+        if not content:
+            print("No content extracted from response.")
+            return [], []
 
-                    try:
-                        json_data = json.loads(content)
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing JSON: {e}")
-                        print(f"Content: {content}")
-                        json_data = extract_json_objects(content)
+        print(f"Extracted content: {content}")
 
-                    if json_data and isinstance(json_data, list):
-                        autogen_agents = []
-                        crewai_agents = []
-                        for index, agent_data in enumerate(json_data, start=1):
-                            print(f"Processing agent data: {agent_data}")
-                            
-                            expert_name = agent_data.get('expert_name', '')
-                            description = agent_data.get('description', '')
-                            role = agent_data.get('role', expert_name)
-                            goal = agent_data.get('goal', f"Assist with tasks related to {description}")
-                            backstory = agent_data.get('backstory', f"As an AI assistant specializing in {expert_name}, I am equipped with extensive knowledge and expertise in {description}")
-                            
-                            if not expert_name:
-                                print("Missing agent name. Skipping...")
-                                continue
+        json_data = parse_json(content)
+        
+        if not json_data:
+            print("Failed to parse JSON data.")
+            return [], []
 
-                            agent_tools = [tool.to_dict() if isinstance(tool, ToolBaseModel) else tool for tool in st.session_state.selected_tools]
-                            current_timestamp = datetime.datetime.now().isoformat()
-                            
-                            autogen_agent_data = {
-                                "id": index,
-                                "name": expert_name,
-                                "description": description,
-                                "type": "assistant",
-                                "config": {
-                                    "name": expert_name,
-                                    "llm_config": {
-                                        "config_list": [
-                                            {
-                                                "user_id": "default",
-                                                "timestamp": current_timestamp,
-                                                "model": st.session_state.model,
-                                                "base_url": None,
-                                                "api_type": None,
-                                                "api_version": None,
-                                                "description": "OpenAI model configuration"
-                                            }
-                                        ],
-                                        "temperature": st.session_state.temperature,
-                                        "cache_seed": 42,
-                                        "timeout": 600,
-                                        "max_tokens": MODEL_TOKEN_LIMITS.get(st.session_state.model, 4096),
-                                        "extra_body": None
-                                    },
-                                    "human_input_mode": "NEVER",
-                                    "max_consecutive_auto_reply": 8,
-                                    "system_message": f"You are a helpful assistant that can act as {expert_name} who {description}."
-                                },
-                                "tools": agent_tools,
-                                "created_at": current_timestamp,
-                                "updated_at": current_timestamp,
-                                "user_id": "default",
-                                "models": [model for model in MODEL_CHOICES if model != "default"],
-                                "verbose": False,
-                                "allow_delegation": False,
-                                "timestamp": current_timestamp,
-                                "role": role,
-                                "goal": goal,
-                                "backstory": backstory,
-                                "provider": st.session_state.get('provider'),
-                                "model": st.session_state.get('model')
-                            }
-                            
-                            try:
-                                agent_model = AgentBaseModel(**autogen_agent_data)
-                                print(f"Created agent: {agent_model.name} with description: {agent_model.description}")
-                                autogen_agents.append(agent_model)
-                            except Exception as e:
-                                print(f"Error creating agent {expert_name}: {str(e)}")
-                                print(f"Agent data: {autogen_agent_data}")
-                                continue
-
-                            crewai_agent_data = {
-                                "name": expert_name,
-                                "description": description,
-                                "tools": [tool['name'] if isinstance(tool, dict) else tool.name for tool in agent_tools],
-                                "verbose": True,
-                                "allow_delegation": True
-                            }
-                            crewai_agents.append(crewai_agent_data)
-
-                        web_retriever_agent = WebContentRetrieverAgent.create_default()
-                        autogen_agent_data = web_retriever_agent.to_dict()
-                        autogen_agent_data['id'] = len(autogen_agents) + 1
-                        autogen_agents.append(AgentBaseModel(**autogen_agent_data))
-                        crewai_agents.append({
-                            "name": web_retriever_agent.name,
-                            "description": web_retriever_agent.description,
-                            "tools": [tool['name'] for tool in web_retriever_agent.tools],
-                            "verbose": True,
-                            "allow_delegation": True
-                        })
-
-                        print(f"AutoGen Agents: {autogen_agents}")
-                        print(f"CrewAI Agents: {crewai_agents}")
-                        
-                        st.session_state.workflow.agents = autogen_agents
-                        return autogen_agents, crewai_agents
-                    else:
-                        print("Invalid JSON format or empty list. Expected a list of agents.")
-                        return [], []
-                else:
-                    print("No agents data found in response")
-            else:
-                print(f"API request failed with status code {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"Error making API request: {e}")
-            retry_count += 1
-            time.sleep(retry_delay)
-    print(f"Maximum retries ({max_retries}) exceeded. Failed to retrieve valid agent names.")
-    return [], []
-
+        return create_agents(json_data)
+    
+    except Exception as e:
+        print(f"Error in get_agents_from_text: {e}")
+        return [], []
+    
 
 def get_discussion_history():
     return st.session_state.discussion_history
 
 
+@st.cache_data(ttl=3600)  # Cache the result for 1 hour
 def get_provider_models(provider=None):
     if provider is None:
         provider = st.session_state.get('provider', LLM_PROVIDER)
-    return MODEL_CHOICES.get(provider, {})
+    return st.session_state.get('available_models') or FALLBACK_MODEL_TOKEN_LIMITS.get(provider, {})
 
 
 def handle_user_request(session_state):
@@ -675,13 +631,7 @@ def handle_user_request(session_state):
             break
 
     if team_of_experts_text:
-        required_params, optional_params = AgentBaseModel.debug_init()
-        print(f"Required params: {required_params}")
-        print(f"Optional params: {optional_params}")
         autogen_agents, crewai_agents = get_agents_from_text(team_of_experts_text)
-
-        print(f"Debug: AutoGen Agents: {autogen_agents}")
-        print(f"Debug: CrewAI Agents: {crewai_agents}")
 
         if not autogen_agents:
             print("Error: No agents created.")
@@ -690,7 +640,6 @@ def handle_user_request(session_state):
 
         session_state.agents = autogen_agents
         session_state.workflow.agents = session_state.agents
-        print(f"Debug: session_state.workflow.agents: {session_state.workflow.agents}")
 
         # Generate the workflow data
         workflow_data, _ = get_workflow_from_agents(autogen_agents)
@@ -713,10 +662,6 @@ def handle_user_request(session_state):
         for agent in workflow_data["receiver"]["groupchat_config"]["agents"]:
             print(agent)
 
-        autogen_zip_buffer, crewai_zip_buffer = zip_files_in_memory(workflow_data)
-        session_state.autogen_zip_buffer = autogen_zip_buffer
-        session_state.crewai_zip_buffer = crewai_zip_buffer
-
         # Indicate that a rerun is needed
         session_state.need_rerun = True
     else:
@@ -727,12 +672,25 @@ def handle_user_request(session_state):
 
 def key_prompt():
     api_key = get_api_key()
-    if api_key is None:
-        api_key = display_api_key_input()
+    api_key = display_api_key_input()
     if api_key is None:
         llm = LLM_PROVIDER.upper()
         st.warning(f"{llm}_API_KEY not found, or select a different provider.")
         return
+
+
+def parse_json(content: str) -> List[Dict[str, Any]]:
+    try:
+        json_data = json.loads(content)
+        if isinstance(json_data, list):
+            return json_data
+        else:
+            print("JSON data is not a list as expected.")
+            return []
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON: {e}")
+        print(f"Content: {content}")
+        return []
 
 
 def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, provider=None):
@@ -741,7 +699,6 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
     refactoring_prompt = get_rephrased_user_prompt(user_request)
 
     if llm_provider is None:
-        # Use the existing functionality for non-CLI calls
         api_key = get_api_key()
         try:
             llm_provider = get_llm_provider(api_key=api_key, provider=provider)
@@ -750,7 +707,7 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
             return None
 
     if max_tokens is None:
-        max_tokens = MODEL_TOKEN_LIMITS.get(model, 4096)
+        max_tokens = llm_provider.get_available_models().get(model, 4096)
 
     llm_request_data = {
         "model": model,
@@ -776,23 +733,20 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
         print(f" Messages: {llm_request_data['messages']}")
 
         response = llm_provider.send_request(llm_request_data)
-        print(f"Response received. Status Code: {response.status_code}")
-        print(f"Response Content: {response.text}")
+        
+        if response is None:
+            print("Error: No response received from the LLM provider.")
+            return None
 
-        if response.status_code == 200:
-            print("Request successful. Parsing response...")
-            response_data = llm_provider.process_response(response)
-            print(f"Response Data: {json.dumps(response_data, indent=2)}")
+        print(f"Response received. Processing response...")
+        response_data = llm_provider.process_response(response)
+        print(f"Response Data: {json.dumps(response_data, indent=2)}")
 
-            if "choices" in response_data and len(response_data["choices"]) > 0:
-                rephrased = response_data["choices"][0]["message"]["content"]
-                return rephrased.strip()
-            else:
-                print("Error: Unexpected response format. 'choices' field missing or empty.")
-                return None
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            rephrased = response_data["choices"][0]["message"]["content"]
+            return rephrased.strip()
         else:
-            print(f"Request failed. Status Code: {response.status_code}")
-            print(f"Response Content: {response.text}")
+            print("Error: Unexpected response format. 'choices' field missing or empty.")
             return None
     except Exception as e:
         print(f"An error occurred: {str(e)}")
@@ -801,8 +755,16 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
 
 def select_model():
     provider = st.session_state.get('provider', LLM_PROVIDER)
-    provider_models = MODEL_CHOICES[provider]
     
+    if 'available_models' not in st.session_state or not st.session_state.available_models:
+        fetch_available_models(provider)
+    
+    provider_models = st.session_state.available_models
+    
+    if not provider_models:
+        st.warning(f"No models available for {provider}. Please check your API key and connection.")
+        return None
+
     if 'model' not in st.session_state or st.session_state.model not in provider_models:
         default_model = next(iter(provider_models))
     else:
@@ -840,6 +802,9 @@ def select_provider():
         api_key = get_api_key(selected_provider)
         if api_key is None:
             display_api_key_input(selected_provider)
+        else:
+            # Fetch available models for the selected provider
+            fetch_available_models(selected_provider)
         
         # Clear the model selection when changing providers
         if 'model' in st.session_state:
@@ -870,7 +835,6 @@ def set_temperature():
         "Set Temperature",
         min_value=0.0,
         max_value=1.0,
-        value=st.session_state.get('temperature', 0.3),
         step=0.01,
         key='temperature_slider',
         on_change=update_temperature,
@@ -888,68 +852,149 @@ def show_interfaces():
     
     st.markdown('<div class="user-input">', unsafe_allow_html=True)
     auto_moderate = st.checkbox("Auto-moderate (slow, eats tokens, but very cool)", key="auto_moderate", on_change=trigger_moderator_agent_if_checked)
-    if auto_moderate and not st.session_state.get("user_input"):
-        moderator_response = trigger_moderator_agent()
+    if auto_moderate:
+        with st.spinner("Auto-moderating..."):
+            moderator_response = trigger_moderator_agent()
         if moderator_response:
-            st.session_state.user_input = moderator_response
-    user_input, reference_url = display_user_input()
+            if st.session_state.next_agent:
+                st.session_state.user_input = f"To {st.session_state.next_agent}: {moderator_response}"
+            else:
+                st.session_state.user_input = moderator_response
+            st.success("Auto-moderation complete. New input has been generated.")
+        else:
+            st.warning("Auto-moderation failed due to rate limiting. Please wait a moment and try again, or proceed manually.")
+    
+    user_input = st.text_area("Additional Input:", value=st.session_state.user_input, height=200, key="user_input_widget")
+    reference_url = st.text_input("URL:", key="reference_url_widget")
+    
     st.markdown('</div>', unsafe_allow_html=True)
+
+    return user_input, reference_url
 
 
 def trigger_moderator_agent():
-    goal = st.session_state.current_project.re_engineered_prompt
+    current_project = st.session_state.current_project
+    goal = current_project.re_engineered_prompt
     last_speaker = st.session_state.last_agent
     last_comment = st.session_state.last_comment
     discussion_history = st.session_state.discussion_history
 
+    deliverable_index, current_deliverable = current_project.get_next_unchecked_deliverable()
+    
+    if current_deliverable is None:
+        if current_project.current_phase != "Deployment":
+            current_project.move_to_next_phase()
+            st.success(f"Moving to {current_project.current_phase} phase!")
+            deliverable_index, current_deliverable = current_project.get_next_unchecked_deliverable()
+        else:
+            st.success("All deliverables have been completed and deployed!")
+            return None
+
+    current_phase = current_project.get_next_uncompleted_phase(deliverable_index)
+    
     team_members = []
     for agent in st.session_state.agents:
         if isinstance(agent, AgentBaseModel):
-            team_members.append(f"{agent.config['name']}: {agent.description}")
+            team_members.append(f"{agent.name}: {agent.description}")
         else:
             # Fallback for dictionary-like structure
-            team_members.append(f"{agent.get('config', {}).get('name', 'Unknown')}: {agent.get('description', 'No description')}")
+            agent_name = agent.get('config', {}).get('name', agent.get('name', 'Unknown'))
+            agent_description = agent.get('description', 'No description')
+            team_members.append(f"{agent_name}: {agent_description}")
     team_members_str = "\n".join(team_members)
 
-    moderator_prompt = get_moderator_prompt(discussion_history, goal, last_comment, last_speaker, team_members_str)
+    moderator_prompt = get_moderator_prompt(discussion_history, goal, last_comment, last_speaker, team_members_str, current_deliverable, current_phase)
 
-    api_key = get_api_key()
-    llm_provider = get_llm_provider(api_key=api_key)
-    llm_request_data = {
-        "model": st.session_state.model,
-        "temperature": st.session_state.temperature,
-        "max_tokens": st.session_state.max_tokens,
-        "top_p": 1,
-        "stop": "TERMINATE",
-        "messages": [
-            {
-                "role": "user",
-                "content": moderator_prompt
-            }
-        ]
-    }
-    # wait for RETRY_DELAY seconds
-    retry_delay = RETRY_DELAY
-    time.sleep(retry_delay)
-    response = llm_provider.send_request(llm_request_data)
+    for attempt in range(MAX_RETRIES):
+        api_key = get_api_key()
+        llm_provider = get_llm_provider(api_key=api_key)
+        llm_request_data = {
+            "model": st.session_state.model,
+            "temperature": st.session_state.temperature,
+            "max_tokens": st.session_state.max_tokens,
+            "top_p": 1,
+            "stop": "TERMINATE",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": moderator_prompt
+                }
+            ]
+        }
+        retry_delay = RETRY_DELAY
+        time.sleep(retry_delay)
+        response = llm_provider.send_request(llm_request_data)
 
-    if response.status_code == 200:
-        response_data = llm_provider.process_response(response)
-        if "choices" in response_data and response_data["choices"]:
-            content = response_data["choices"][0]["message"]["content"]
+        if isinstance(response, dict) and 'choices' in response:
+            # Handle response from providers like Groq
+            content = response['choices'][0]['message']['content']
+        elif hasattr(response, 'content') and isinstance(response.content, list):
+            # Handle Anthropic-style response
+            content = response.content[0].text
+        else:
+            print(f"Unexpected response format: {type(response)}")
+            continue
+
+        if content:
+            # Extract the agent name from the content
+            agent_name_match = re.match(r"To (\w+( \w+)*):", content)
+            if agent_name_match:
+                next_agent = agent_name_match.group(1)
+                # Check if the extracted name is a valid agent and not a tool
+                if any(agent.name.lower() == next_agent.lower() for agent in st.session_state.agents):
+                    st.session_state.next_agent = next_agent
+                    # Remove the "To [Agent Name]:" prefix from the content
+                    content = re.sub(r"^To \w+( \w+)*:\s*", "", content).strip()
+                else:
+                    st.warning(f"'{next_agent}' is not a valid agent. Please select a valid agent.")
+                    st.session_state.next_agent = None
+            else:
+                st.session_state.next_agent = None
+            
+            if "PHASE_COMPLETED" in content:
+                current_project.mark_deliverable_phase_done(deliverable_index, current_phase)
+                content = content.replace("PHASE_COMPLETED", "").strip()
+                st.success(f"Phase {current_phase} completed for deliverable: {current_deliverable}")
+            
+            if "DELIVERABLE_COMPLETED" in content:
+                current_project.mark_deliverable_done(deliverable_index)
+                content = content.replace("DELIVERABLE_COMPLETED", "").strip()
+                st.success(f"Deliverable completed: {current_deliverable}")
+            
             return content.strip()
 
+    logger.error("All retry attempts failed.")
     return None
 
 
 def trigger_moderator_agent_if_checked():
     if st.session_state.get("auto_moderate", False):
-        trigger_moderator_agent()
+        with st.spinner("Auto-moderating..."):
+            moderator_response = trigger_moderator_agent()
+        if moderator_response:
+            st.session_state.user_input = moderator_response
+            st.success("Auto-moderation complete. New input has been generated.")
+        else:
+            st.warning("Auto-moderation did not produce a response. Please try again or proceed manually.")
+    st.experimental_rerun()
 
 
 def update_api_url(provider):
     api_url_key = f"{provider.upper()}_API_URL"
     st.session_state.api_url = st.session_state.get(api_url_key)
+
+
+def update_deliverable_status(index):
+    current_project = st.session_state.current_project
+    is_checked = st.session_state[f"deliverable_{index}"]
+    if is_checked:
+        for phase in current_project.implementation_phases:
+            current_project.mark_deliverable_phase_done(index, phase)
+    else:
+        current_project.deliverables[index]["done"] = False
+        for phase in current_project.implementation_phases:
+            current_project.deliverables[index]["phase"][phase] = False
+    st.experimental_rerun()
 
 
 def update_discussion_and_whiteboard(agent_name, response, user_input):
